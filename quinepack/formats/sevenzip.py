@@ -36,6 +36,7 @@ from ..lzma2 import (
     store_hdr,
 )
 from ..model import Payload
+from ..progress import report
 
 SIG = b"7z\xbc\xaf'\x1c"
 VER = b"\x00\x04"
@@ -48,10 +49,10 @@ SEED_NOTE = b"\nQuinePack seed"
 class BuildResult:
     """In-memory 7z quine archive plus the metadata needed to verify it."""
 
-    data: bytes
+    data: bytes | bytearray
     entries: tuple[tuple[str, bool], ...]
     files: tuple[tuple[str, bytes], ...]
-    seed: bytes
+    seed: bytes | bytearray
     layout: dict[str, object]
     compressed: bool
 
@@ -89,6 +90,13 @@ def _crc32(data, value: int = 0) -> int:
 
 def _filetime(mtime_ns: int) -> int:
     return mtime_ns // 100 + FILETIME_EPOCH_OFFSET
+
+
+def _join_files(files: tuple[tuple[str, bytes], ...]) -> bytes:
+    """Concatenate payload bytes without copying a single-file payload twice."""
+    if len(files) == 1:
+        return files[0][1]
+    return b"".join(data for _, data in files)
 
 
 def _prepare_entries(
@@ -196,7 +204,7 @@ class _StoreBuilder:
     def __init__(self, entries: tuple[_Entry, ...], files: tuple[tuple[str, bytes], ...]):
         self.entries = entries
         self.files = files
-        self.content = b"".join(data for _, data in files)
+        self.content = _join_files(files)
 
     def layout(self, d_seed: int, maxdist_hint: int) -> dict[str, object]:
         d = d_seed + len(self.content)
@@ -414,7 +422,7 @@ class _StoreBuilder:
 
     def assemble(
         self, layout: dict[str, object]
-    ) -> tuple[bytearray, bytes]:
+    ) -> tuple[bytearray, bytes | bytearray]:
         total = int(layout["total"])
         d = int(layout["d"])
         d_seed = int(layout["ds"])
@@ -457,17 +465,15 @@ class _StoreBuilder:
         pad = (SEED_NOTE * (d_seed // len(SEED_NOTE) + 2))[: d_seed - 6 - jump_len]
         seed[6 + jump_len :] = pad
 
-        payload = bytes(seed) + self.content + bytes(out[0:35])
-        assert len(payload) == d + 35
         for chunk in chunks:
             if chunk["kind"] != "store":
                 continue
             offset = chunk["ooff"]
             length = chunk["olen"]
             if chunk.get("c1"):
-                out[chunk["foff"] + 3 : chunk["foff"] + 3 + length] = payload[
-                    chunk["S"] : chunk["S"] + length
-                ]
+                self._copy_store_source(
+                    out, chunk["foff"] + 3, chunk["S"], length, seed
+                )
             elif chunk.get("vac"):
                 start = offset - d
                 out[start : start + length] = out[start + length : start + 2 * length]
@@ -476,10 +482,38 @@ class _StoreBuilder:
                 out[chunk["foff"] + 3 : chunk["foff"] + 3 + length] = out[
                     start : start + length
                 ]
-        return out, bytes(seed)
+        return out, seed
+
+    def _copy_store_source(
+        self,
+        out: bytearray,
+        target: int,
+        source: int,
+        length: int,
+        seed: bytearray,
+    ) -> None:
+        """Fill a store chunk from ``seed + content + out[0:35]`` in pieces."""
+        seed_length = len(seed)
+        if source < seed_length:
+            piece = min(length, seed_length - source)
+            out[target : target + piece] = seed[source : source + piece]
+            target += piece
+            source += piece
+            length -= piece
+        content_length = len(self.content)
+        if length and source < seed_length + content_length:
+            start = source - seed_length
+            piece = min(length, content_length - start)
+            out[target : target + piece] = self.content[start : start + piece]
+            target += piece
+            source += piece
+            length -= piece
+        if length:
+            start = source - seed_length - content_length
+            out[target : target + length] = out[start : start + length]
 
     def solve_crc(
-        self, out: bytearray, layout: dict[str, object], seed: bytes
+        self, out: bytearray, layout: dict[str, object], seed: bytes | bytearray
     ) -> list[int]:
         gadget_size = int(layout["T"])
         header_size = int(layout["h"])
@@ -574,10 +608,11 @@ class _StoreBuilder:
         assert targets() == tuple(values), "CRC fix-up failed"
         return values
 
-    def build(self) -> tuple[bytes, dict[str, object], bytes]:
+    def build(self) -> tuple[bytes | bytearray, dict[str, object], bytes | bytearray]:
         max_distance = 2 * (len(self.content) + 128) + (1 << 21)
         d_seed = 64
         last_error: Exception | None = None
+        report("laying out")
         for _ in range(80):
             d = d_seed + len(self.content)
             if (d + 35) % CHUNK == 1:
@@ -585,9 +620,11 @@ class _StoreBuilder:
                 continue
             try:
                 layout = self.layout(d_seed, max_distance)
+                report("assembling")
                 out, seed = self.assemble(layout)
+                report("fixing CRCs")
                 self.solve_crc(out, layout, seed)
-                return bytes(out), layout, seed
+                return out, layout, seed
             except (RuntimeError, AssertionError) as error:
                 last_error = error
                 d_seed += 1
@@ -609,8 +646,10 @@ class _DoubleBuilder:
         self.entries = entries
         self.files = files
         self.preset = preset
-        self.content = b"".join(data for _, data in files)
+        self.content = _join_files(files)
         self._compressed_content = b""
+        self._streams_cache: dict[str, object] | None = None
+        self._mseg_cache: bytes | None = None
 
     # -- structure ---------------------------------------------------------
 
@@ -623,7 +662,11 @@ class _DoubleBuilder:
         self._compressed_content = compressed
         lc = len(compressed)
 
-        plant_len, header_len, mseg_len = 96, 256, 256
+        # Seed the fixed point near the usual ratio of match-segment
+        # bytes to archive bytes so the loop converges in a few rounds.
+        plant_len = 96
+        header_len = 256
+        mseg_len = max(256, lc // 2000)
         for _ in range(1000):
             ds = lc + 32 + header_len + plant_len
             d = len(content) + ds
@@ -658,6 +701,8 @@ class _DoubleBuilder:
                 and new_mseg_len == mseg_len
                 and required_plant <= plant_len
             ):
+                self._streams_cache = streams
+                self._mseg_cache = mseg
                 return {"Y": plant_len, "H": header_len, "M": mseg_len}
             # Grow the plant instead of shrinking it: a larger seed can always
             # absorb the difference as deterministic zero padding, and this
@@ -681,8 +726,14 @@ class _DoubleBuilder:
         inner_len = inner_prefix + lc + m1
         dict_out, dict_out_size = dict_prop_for(max(inner_len, 1 << 20))
 
-        streams = self._build_streams(lc, seed_lengths, inner_prefix, mseg_lengths)
-        mseg = self._build_mseg(streams, d, lc, header_len)
+        if self._streams_cache is not None and self._mseg_cache is not None:
+            streams = self._streams_cache
+            mseg = self._mseg_cache
+        else:
+            streams = self._build_streams(
+                lc, seed_lengths, inner_prefix, mseg_lengths
+            )
+            mseg = self._build_mseg(streams, d, lc, header_len)
         assert len(mseg) == mseg_len, f"Mseg {len(mseg)} != {mseg_len}"
         total = streams["n"] + 32 + header_len
         dict_in, dict_in_size = dict_prop_for(d + total + 8192)
@@ -696,9 +747,14 @@ class _DoubleBuilder:
             bind_pairs=((1, 0),),
         )
         assert len(header) == header_len, f"header {len(header)} != {header_len}"
-        plant = streams["hdr_bytes"] + streams["mech"] + mseg + b"\x00\x00"
-        assert len(plant) <= plant_len, f"plant {len(plant)} > {plant_len}"
-        plant += b"\x00" * (plant_len - len(plant))
+        plant_parts = (
+            streams["hdr_bytes"],
+            streams["mech"],
+            mseg,
+            b"\x00\x00",
+        )
+        plant_size = sum(len(part) for part in plant_parts)
+        assert plant_size <= plant_len, f"plant {plant_size} > {plant_len}"
         return {
             "C": compressed,
             "lc": lc,
@@ -718,7 +774,8 @@ class _DoubleBuilder:
             "total": total,
             "header": header,
             "crc_base": crc_base,
-            "plant": plant,
+            "plant_parts": plant_parts,
+            "plant_pad": plant_len - plant_size,
             "dict_size_in": dict_in_size,
             "dict_size_out": dict_out_size,
             "n_sub": len(sub_sizes),
@@ -760,7 +817,6 @@ class _DoubleBuilder:
                     "size": len(block),
                     "ioff": out_pos,
                     "olen": unpacked,
-                    "bytes": block,
                     "mech": len(mech),
                 }
             )
@@ -859,7 +915,7 @@ class _DoubleBuilder:
         file_pos += 1
         return {
             "ochunks": chunks,
-            "mech": bytes(mech),
+            "mech": mech,
             "hdr_tab": header_table,
             "hdr_bytes": b"".join(header_table),
             "n": file_pos - 32,
@@ -906,34 +962,37 @@ class _DoubleBuilder:
             position += length
         assert position == total, f"segments cover {position} != {total}"
 
-        output: list[tuple[list[tuple[str, int] | tuple[str, int, int]], int, int]] = []
+        # Encode one LZMA2 chunk as soon as it is full so the whole token
+        # stream is never resident at once.
+        mseg = bytearray()
         out_pos = d
         tokens: list[tuple[str, int] | tuple[str, int, int]] = []
         token_len = 0
+
+        def flush_tokens() -> None:
+            nonlocal out_pos, tokens, token_len
+            if not tokens:
+                return
+            block, unpacked = lzma_chunk(tokens, out_pos)
+            assert unpacked == token_len
+            mseg.extend(block)
+            out_pos += token_len
+            tokens, token_len = [], 0
+
         for foff, length, source_pos in segments:
             distance = (d + foff) - source_pos
             assert distance > 0, f"bad distance {distance} at {foff}"
             if token_len and token_len + length > LZ2_MAX_UNPACKED - MAX_MATCH:
-                output.append((tokens, out_pos, token_len))
-                out_pos += token_len
-                tokens, token_len = [], 0
+                flush_tokens()
             tokens.extend(matches_for(distance, length))
             token_len += length
-        if tokens:
-            output.append((tokens, out_pos, token_len))
-            out_pos += token_len
+        flush_tokens()
         assert out_pos == d + total, f"Mseg output {out_pos} != {d + total}"
-
-        mseg = bytearray()
-        for chunk_tokens, chunk_pos, chunk_len in output:
-            block, unpacked = lzma_chunk(chunk_tokens, chunk_pos)
-            assert unpacked == chunk_len
-            mseg.extend(block)
         return bytes(mseg)
 
     # -- assembly and CRC --------------------------------------------------
 
-    def assemble(self, layout: dict[str, object]) -> tuple[bytearray, bytes]:
+    def assemble(self, layout: dict[str, object]) -> tuple[bytearray, bytearray]:
         total = int(layout["total"])
         header_len = int(layout["H"])
         header_offset = total - header_len
@@ -944,21 +1003,35 @@ class _DoubleBuilder:
         out[6:8] = VER
         struct.pack_into("<Q", out, 12, int(layout["n"]))
         struct.pack_into("<Q", out, 20, header_len)
+        mech = layout["mech"]
         for chunk in chunks:
             if chunk["kind"] == "store":
                 out[chunk["foff"] : chunk["foff"] + 3] = layout["hdr_tab"][chunk["hdr"]]
+            elif chunk["kind"] == "term":
+                out[chunk["foff"] : chunk["foff"] + 1] = chunk["bytes"]
             else:
-                out[chunk["foff"] : chunk["foff"] + chunk["size"]] = chunk["bytes"]
+                start = chunk["mech"]
+                out[chunk["foff"] : chunk["foff"] + chunk["size"]] = mech[
+                    start : start + chunk["size"]
+                ]
         out[header_offset : header_offset + header_len] = layout["header"]
 
         compressed = layout["C"]
-        plant = layout["plant"]
-        seed = bytearray()
-        seed += compressed
-        seed += bytes(out[0:32])
-        seed += bytes(out[header_offset : header_offset + header_len])
-        seed += plant
-        assert len(seed) == layout["ds"], f"seed {len(seed)} != {layout['ds']}"
+        seed = bytearray(int(layout["ds"]))
+        lc = int(layout["lc"])
+        seed[0:lc] = compressed
+        seed[lc : lc + 32] = out[0:32]
+        seed[lc + 32 : lc + 32 + header_len] = out[
+            header_offset : header_offset + header_len
+        ]
+        position = lc + 32 + header_len
+        for part in layout["plant_parts"]:
+            seed[position : position + len(part)] = part
+            position += len(part)
+        pad = int(layout["plant_pad"])
+        if pad:
+            seed[position:] = b"\x00" * pad
+        assert position + pad == layout["ds"], "seed size mismatch"
 
         mseg_tail = layout["mseg"] + b"\x00"
         for chunk in chunks:
@@ -977,7 +1050,7 @@ class _DoubleBuilder:
                 out[start : start + length] = mseg_tail[
                     source[1] : source[1] + length
                 ]
-        return out, bytes(seed)
+        return out, seed
 
     def _seed_offsets(self, layout: dict[str, object], offset: int) -> tuple[int, int]:
         for chunk in layout["ochunks"]:
@@ -1001,7 +1074,7 @@ class _DoubleBuilder:
         return positions
 
     def solve_crc(
-        self, out: bytearray, layout: dict[str, object], compressed: bytes, plant: bytes
+        self, out: bytearray, layout: dict[str, object], compressed: bytes
     ) -> list[int]:
         header_len = int(layout["H"])
         header_offset = int(layout["total"]) - header_len
@@ -1011,11 +1084,18 @@ class _DoubleBuilder:
         s32_positions = self._seed_positions(layout, lc, 32)
         view = memoryview(out)
 
+        pad = int(layout["plant_pad"])
+        plant_parts = layout["plant_parts"]
+
         def seed_crc() -> int:
             value = _crc32(compressed)
             value = _crc32(view[0:32], value)
             value = _crc32(view[header_offset : header_offset + header_len], value)
-            return _crc32(plant, value)
+            for part in plant_parts:
+                value = _crc32(part, value)
+            if pad:
+                value = _crc32(b"\x00" * pad, value)
+            return value
 
         def targets() -> tuple[int, int, int, int]:
             return (
@@ -1109,19 +1189,23 @@ class _DoubleBuilder:
         assert targets() == tuple(values), "CRC fix-up failed"
         return values
 
-    def build(self) -> tuple[bytes, dict[str, object], bytes]:
+    def build(self) -> tuple[bytes | bytearray, dict[str, object], bytes | bytearray]:
+        report("compressing")
         first = self.layout()
+        report("laying out")
         layout = self.finalize(first["Y"], first["H"], first["M"])
-        out, _ = self.assemble(layout)
-        self.solve_crc(out, layout, layout["C"], layout["plant"])
+        report("assembling")
+        out, seed = self.assemble(layout)
+        report("fixing CRCs")
+        self.solve_crc(out, layout, layout["C"])
         header_offset = int(layout["total"]) - int(layout["H"])
-        seed = (
-            layout["C"]
-            + bytes(out[0:32])
-            + bytes(out[header_offset : header_offset + int(layout["H"])])
-            + layout["plant"]
-        )
-        return bytes(out), layout, seed
+        lc = int(layout["lc"])
+        header_len = int(layout["H"])
+        seed[lc : lc + 32] = out[0:32]
+        seed[lc + 32 : lc + 32 + header_len] = out[
+            header_offset : header_offset + header_len
+        ]
+        return out, layout, seed
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1215,7 @@ class _DoubleBuilder:
 
 def _public_layout(layout: dict[str, object], compressed: bool) -> dict[str, object]:
     keys = (
-        ("C", "lc", "dc", "ds", "d", "Li", "M", "H", "Y", "n", "total",
+        ("lc", "dc", "ds", "d", "Li", "M", "H", "Y", "n", "total",
          "dict_size_in", "dict_size_out", "n_sub")
         if compressed
         else ("d", "ds", "k", "n", "total", "T", "h", "n_sub", "dict_size")

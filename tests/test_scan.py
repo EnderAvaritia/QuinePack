@@ -222,6 +222,21 @@ def test_symlink_directory_cycle_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(PayloadError, match="cycle"):
         scan_payload(root)
 
+def test_casefold_collisions_warn_without_renaming() -> None:
+    warnings: list[str] = []
+    index = scan._CaseFoldIndex(warnings.append)
+
+    index.note("Docs/Readme.md")
+    index.note("docs/readme.md")
+    index.note("DOCS/README.MD")
+    index.note("other.txt")
+
+    assert len(warnings) == 2
+    assert "Docs/Readme.md" in warnings[0]
+    assert "docs/readme.md" in warnings[0]
+    assert "DOCS/README.MD" in warnings[1]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only case folding")
 def test_exclude_is_case_insensitive_on_windows(tmp_path: Path) -> None:
     root = tmp_path / "site"

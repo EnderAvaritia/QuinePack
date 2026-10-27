@@ -323,29 +323,40 @@ def lzma_chunk(tokens: list[Token], out_pos: int) -> tuple[bytes, int]:
     return header + data, total
 
 
-def lzma2_raw(data: bytes, dict_size: int, preset: int = 6) -> bytes:
-    """Raw LZMA2 compression without the trailing 0x00 end marker."""
+def lzma2_raw(data: bytes, dict_size: int, preset: int = 6) -> bytearray:
+    """Raw LZMA2 compression without the trailing 0x00 end marker.
+
+    Input is fed in blocks so the compressor never materialises a second full
+    copy of the payload.
+    """
     compressor = lzma.LZMACompressor(
         format=lzma.FORMAT_RAW,
         filters=[
             {"id": lzma.FILTER_LZMA2, "dict_size": dict_size, "preset": preset}
         ],
     )
-    out = compressor.compress(data) + compressor.flush()
+    view = memoryview(data)
+    out = bytearray()
+    block = 1 << 20
+    for offset in range(0, len(view), block):
+        out += compressor.compress(view[offset : offset + block])
+    out += compressor.flush()
     assert out and out[-1] == 0x00, "LZMA2 stream must end with 0x00"
-    return out[:-1]
+    del out[-1]
+    return out
 
 
-def clear_dict_reset(data: bytes) -> bytes:
+def clear_dict_reset(data: bytearray) -> bytearray:
     """Drop the leading dictionary reset so this stream can follow other chunks."""
     if not data:
-        return b""
+        return data
     control = data[0]
     if control >= 0xE0:
         control ^= 0x20
     elif control == 0x01:
         control = 0x02
-    return bytes([control]) + data[1:]
+    data[0] = control
+    return data
 
 
 def split_len(total: int, cap: int) -> list[int]:

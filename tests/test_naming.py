@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,13 @@ def test_only_7z_is_compressed() -> None:
 
 def test_artifact_name_conflict_is_rejected(tmp_path: Path) -> None:
     payload = _payload(tmp_path / "site", ("index.html", "site.7z"))
+    with pytest.raises(PayloadError, match="site.7z"):
+        ensure_artifact_not_in_payload(payload, "site.7z")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only case folding")
+def test_artifact_name_conflict_ignores_case_on_windows(tmp_path: Path) -> None:
+    payload = _payload(tmp_path / "site", ("SITE.7Z",))
     with pytest.raises(PayloadError, match="site.7z"):
         ensure_artifact_not_in_payload(payload, "site.7z")
 

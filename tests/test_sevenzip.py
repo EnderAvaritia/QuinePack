@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -9,15 +10,35 @@ from pathlib import Path
 
 import pytest
 
+from quinepack.errors import SevenZipMissingError
 from quinepack.formats.sevenzip import (
     BuildResult,
     build_archive,
     verify_built,
 )
 from quinepack.model import Payload, PayloadEntry
+from quinepack.verify import find_seven_zip
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SEVEN_ZIP = REPO_ROOT / "_tmp" / "7zextra" / "x64" / "7za.exe"
+
+
+def _find_seven_zip() -> Path | None:
+    try:
+        return find_seven_zip()
+    except SevenZipMissingError:
+        pass
+    candidates = [REPO_ROOT / "_tmp" / "7zextra" / "x64" / "7za.exe"]
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "7-Zip" / "7z.exe")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Programs" / "7-Zip" / "7z.exe")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+SEVEN_ZIP = _find_seven_zip()
 MTIME_A = 1_600_000_000_000_000_000
 MTIME_B = 1_600_000_123_456_789_000
 
@@ -203,7 +224,7 @@ def test_build_is_deterministic() -> None:
     assert store_first.data == store_second.data
 
 
-@pytest.mark.skipif(not SEVEN_ZIP.exists(), reason="official 7-Zip is not available")
+@pytest.mark.skipif(SEVEN_ZIP is None, reason="official 7-Zip is not available")
 def test_external_7za_accepts_archives() -> None:
     payload = _payload(
         (

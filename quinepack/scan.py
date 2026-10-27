@@ -8,7 +8,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .errors import PayloadError
@@ -18,7 +18,11 @@ from .naming import SEED_DIR
 MAX_PAYLOAD_BYTES = 1 << 30
 
 
-def scan_payload(input_path: Path, excludes: Sequence[str] = ()) -> Payload:
+def scan_payload(
+    input_path: Path,
+    excludes: Sequence[str] = (),
+    warn: Callable[[str], None] | None = None,
+) -> Payload:
     """Scan a local file or directory tree into a payload."""
 
     source = Path(input_path)
@@ -30,7 +34,7 @@ def scan_payload(input_path: Path, excludes: Sequence[str] = ()) -> Payload:
         raise PayloadError(f"cannot access input {source}: {exc}") from exc
 
     if stat.S_ISDIR(info.st_mode):
-        return _DirectoryScanner(source, excludes).run()
+        return _DirectoryScanner(source, excludes, warn).run()
     if stat.S_ISREG(info.st_mode):
         return _scan_file(source, info)
     raise PayloadError(f"input is neither a regular file nor a directory: {source}")
@@ -58,12 +62,37 @@ def _scan_file(source: Path, info: os.stat_result) -> Payload:
     )
 
 
+class _CaseFoldIndex:
+    """Report paths that collide on a case-insensitive filesystem."""
+
+    def __init__(self, warn: Callable[[str], None] | None) -> None:
+        self.warn = warn
+        self.seen: dict[str, str] = {}
+
+    def note(self, path: str) -> None:
+        key = path.casefold()
+        previous = self.seen.get(key)
+        if previous is None:
+            self.seen[key] = path
+        elif previous != path and self.warn is not None:
+            self.warn(
+                "case-insensitive path collision: "
+                f"{previous!r} and {path!r}"
+            )
+
+
 class _DirectoryScanner:
     """Depth-first walk that keeps directories before files on every level."""
 
-    def __init__(self, root: Path, excludes: Sequence[str]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        excludes: Sequence[str],
+        warn: Callable[[str], None] | None = None,
+    ) -> None:
         self.root = root
         self.patterns = _normalize_excludes(excludes)
+        self.paths = _CaseFoldIndex(warn)
         self.entries: list[PayloadEntry] = []
         self.total_bytes = 0
 
@@ -103,8 +132,10 @@ class _DirectoryScanner:
             except OSError as exc:
                 raise PayloadError(f"cannot stat {rel}: {exc}") from exc
             if stat.S_ISDIR(info.st_mode):
+                self.paths.note(rel)
                 directories.append((child, info, rel))
             elif stat.S_ISREG(info.st_mode):
+                self.paths.note(rel)
                 files.append((child, info, rel))
             else:
                 raise PayloadError(f"unsupported file type: {rel}")

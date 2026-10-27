@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .errors import PayloadError
@@ -54,11 +55,19 @@ def format_from_artifact_name(name: str) -> str | None:
     return None
 
 
+def _same_name(left: str, right: str) -> bool:
+    """Compare entry names the way the host filesystem would."""
+
+    if os.name == "nt":
+        return left.casefold() == right.casefold()
+    return left == right
+
+
 def ensure_artifact_not_in_payload(payload: Payload, artifact: str) -> None:
     """Reject a payload that already contains an entry named like the artifact."""
 
     for entry in payload.entries:
-        if entry.path == artifact:
+        if _same_name(entry.path, artifact):
             raise PayloadError(f"payload already contains an entry named {artifact!r}")
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,12 +10,33 @@ from pathlib import Path
 import pytest
 
 from quinepack import cli
+from quinepack.errors import SevenZipMissingError
+from quinepack.verify import find_seven_zip
 
-SEVEN_ZIP = Path(__file__).resolve().parents[1] / "_tmp" / "7zextra" / "x64" / "7za.exe"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _find_seven_zip() -> Path | None:
+    try:
+        return find_seven_zip()
+    except SevenZipMissingError:
+        pass
+    candidates = [REPO_ROOT / "_tmp" / "7zextra" / "x64" / "7za.exe"]
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "7-Zip" / "7z.exe")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        candidates.append(Path(local) / "Programs" / "7-Zip" / "7z.exe")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+SEVEN_ZIP = _find_seven_zip()
 
 
 pytestmark = pytest.mark.skipif(
-    not SEVEN_ZIP.exists(), reason="official 7-Zip is not available"
+    SEVEN_ZIP is None, reason="official 7-Zip is not available"
 )
 
 
@@ -151,6 +173,65 @@ def test_verify_subcommand_honors_exclude(tmp_path: Path) -> None:
             ]
         )
         == 0
+    )
+
+
+def test_size_gates_against_official_7z_and_plain_tar(tmp_path: Path) -> None:
+    import tarfile
+
+    site = _make_site(tmp_path)
+    (site / "manual.txt").write_text(
+        ("quinepack size gate " * 80 + "\n") * 120, encoding="utf-8"
+    )
+    outdir = tmp_path / "out"
+
+    assert (
+        cli.main(
+            [
+                "pack",
+                str(site),
+                "--format",
+                "all",
+                "--outdir",
+                str(outdir),
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+
+    plain_7z = tmp_path / "plain.7z"
+    plain_store = tmp_path / "plain.store.7z"
+    for target, extra in (
+        (plain_7z, []),
+        (plain_store, ["-mx=0"]),
+    ):
+        completed = subprocess.run(
+            [str(SEVEN_ZIP), "a", "-t7z", *extra, str(target), "."],
+            cwd=site,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    plain_tar = tmp_path / "plain.tar"
+    with tarfile.open(plain_tar, "w") as archive:
+        for path in sorted(site.rglob("*")):
+            archive.add(path, arcname=path.relative_to(site).as_posix())
+
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    def allowance(base: int, percent: int, floor: int) -> int:
+        return base + max(base * percent // 100, floor)
+
+    assert size(outdir / "site.7z") <= allowance(size(plain_7z), 2, 256 << 10)
+    assert size(outdir / "site.store.7z") <= allowance(
+        size(plain_store), 5, 512 << 10
+    )
+    assert size(outdir / "site.tar.xz") <= allowance(
+        size(plain_tar), 5, 512 << 10
     )
 
 

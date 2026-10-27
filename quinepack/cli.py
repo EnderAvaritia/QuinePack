@@ -23,6 +23,7 @@ from .naming import (
     format_is_compressed,
     seed_name,
 )
+from .progress import stage_sink
 from .scan import scan_payload
 from .verify import verify_archive
 
@@ -53,6 +54,9 @@ class _Reporter:
 
     def warning(self, message: str) -> None:
         print(f"warning: {message}", file=sys.stderr)
+
+    def stage(self, message: str) -> None:
+        self.info(f"{message}...")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -166,8 +170,10 @@ def _command_pack(args: argparse.Namespace) -> int:
     elif not _is_interactive():
         raise UsageError("--format is required when not running in a terminal")
 
-    reporter.detail(f"scanning {args.input}")
-    payload = scan_payload(args.input, tuple(args.exclude))
+    reporter.stage("scanning")
+    payload = scan_payload(
+        args.input, tuple(args.exclude), warn=reporter.warning
+    )
     reporter.detail(f"payload: {len(payload.entries)} entries, {payload.total_bytes} bytes")
 
     if formats is None:
@@ -185,12 +191,14 @@ def _command_pack(args: argparse.Namespace) -> int:
     for format_key, output in selected:
         output.parent.mkdir(parents=True, exist_ok=True)
         reporter.info(f"building {output.name}")
-        data = _build(payload, format_key, output.name, preset)
+        with stage_sink(reporter.stage):
+            data = _build(payload, format_key, output.name, preset)
+        reporter.stage("writing")
         _write_atomic(output, data)
         reporter.info(f"wrote {output} ({_human_size(len(data))})")
 
         if args.verify:
-            reporter.info(f"verifying {output}")
+            reporter.stage("verifying")
             verify_archive(
                 output,
                 against=args.input,
@@ -287,7 +295,7 @@ def _build(
     format_key: str,
     artifact: str,
     preset: int,
-) -> bytes:
+) -> bytes | bytearray:
     try:
         if format_key == "txz":
             from .formats.tarxz import build_archive
@@ -319,10 +327,10 @@ def _build(
     data = getattr(result, "data", None)
     if not isinstance(data, (bytes, bytearray)):
         raise QuinePackError(f"the {format_key} writer returned no archive data")
-    return bytes(data)
+    return data
 
 
-def _write_atomic(output: Path, data: bytes) -> None:
+def _write_atomic(output: Path, data: bytes | bytearray) -> None:
     partial = output.with_name(f"{output.name}.partial")
     try:
         with open(partial, "wb") as handle:

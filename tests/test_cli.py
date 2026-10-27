@@ -335,6 +335,27 @@ def test_pack_warns_when_preset_used_with_store(
     assert fake_writer.calls[0].preset == 3
 
 
+def test_scan_warnings_are_printed(
+    tmp_path: Path,
+    fake_writer: _FakeWriter,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "app.txt"
+    source.write_bytes(b"hello")
+    payload = Payload(source, (), 0, True)
+
+    def fake_scan(path, excludes=(), warn=None):
+        assert warn is not None
+        warn("case-insensitive path collision: 'A' and 'a'")
+        return payload
+
+    monkeypatch.setattr(cli, "scan_payload", fake_scan)
+
+    assert cli.main(["pack", str(source), "--format", "7z", "--quiet"]) == 0
+    assert "case-insensitive" in capsys.readouterr().err
+
+
 def test_quiet_suppresses_progress(
     tmp_path: Path, fake_writer: _FakeWriter, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -689,6 +710,9 @@ def test_find_seven_zip_searches_path_in_order(monkeypatch: pytest.MonkeyPatch) 
 
 def test_find_seven_zip_reports_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(verify_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        verify_module, "_standard_install_candidates", lambda: ()
+    )
 
     with pytest.raises(SevenZipMissingError, match="7-Zip"):
         verify_module.find_seven_zip()

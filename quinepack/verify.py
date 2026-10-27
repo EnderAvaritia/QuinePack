@@ -37,9 +37,29 @@ def find_seven_zip(explicit: str | Path | None = None) -> Path:
         located = shutil.which(name)
         if located is not None:
             return Path(located)
+    for candidate in _standard_install_candidates():
+        if candidate.is_file():
+            return candidate
     raise SevenZipMissingError(
         "7-Zip executable not found; install 7-Zip or pass --7zr PATH"
     )
+
+
+def _standard_install_candidates() -> tuple[Path, ...]:
+    """Common 7-Zip install locations on Windows, after the PATH lookup."""
+    if os.name != "nt":
+        return ()
+    roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    local = os.environ.get("LOCALAPPDATA")
+    candidates = [
+        Path(root) / "7-Zip" / "7z.exe" for root in roots if root
+    ]
+    if local:
+        candidates.append(Path(local) / "Programs" / "7-Zip" / "7z.exe")
+    return tuple(candidates)
 
 
 def extract_archive(seven_zip: Path, archive: Path, destination: Path) -> None:
@@ -118,6 +138,11 @@ def _extract_txz(archive: Path, destination: Path) -> None:
 
 def _safe_extract(tar: tarfile.TarFile, destination: Path) -> None:
     root = destination.resolve()
+    # Python 3.12+ warns unless an extraction filter is chosen; the checks
+    # below already reject absolute paths and links out of the destination.
+    extract_kwargs = (
+        {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
+    )
     for member in tar.getmembers():
         if not (member.isreg() or member.isdir()):
             raise VerificationError(
@@ -126,7 +151,7 @@ def _safe_extract(tar: tarfile.TarFile, destination: Path) -> None:
         target = (destination / member.name).resolve()
         if not target.is_relative_to(root):
             raise VerificationError(f"archive entry escapes destination: {member.name}")
-        tar.extract(member, destination)
+        tar.extract(member, destination, **extract_kwargs)
 
 
 def _verify_self_copy(archive: Path, extracted: Path) -> None:
