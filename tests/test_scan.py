@@ -161,6 +161,23 @@ def test_exclude_accepts_trailing_separator_and_dot_prefix(tmp_path: Path) -> No
     assert [entry.path for entry in payload.entries] == ["keep.txt"]
 
 
+def test_single_file_change_while_reading_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write(tmp_path / "app.txt", b"payload")
+    original = Path.read_bytes
+
+    def changing_read(self: Path) -> bytes:
+        data = original(self)
+        os.utime(self, ns=(1_700_000_000_000_000_000,) * 2)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read)
+
+    with pytest.raises(PayloadError, match="changed while reading"):
+        scan_payload(source)
+
+
 def test_missing_input_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(PayloadError, match="does not exist"):
         scan_payload(tmp_path / "missing")

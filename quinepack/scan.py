@@ -46,6 +46,12 @@ def _scan_file(source: Path, info: os.stat_result) -> Payload:
         raise PayloadError(_too_large_message(size))
 
     data = _read_file(source, f"file: {source}", size)
+    try:
+        after = source.stat()
+    except OSError as exc:
+        raise PayloadError(f"cannot stat {source}: {exc}") from exc
+    if after.st_size != size or after.st_mtime_ns != info.st_mtime_ns:
+        raise PayloadError(f"file changed while reading: {source}")
     entry = PayloadEntry(
         path=source.name,
         is_dir=False,
