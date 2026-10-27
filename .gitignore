@@ -1,0 +1,7 @@
+.codegraph/
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.tmp
