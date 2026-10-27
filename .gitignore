@@ -1,7 +1,14 @@
 .codegraph/
+.omo/
+.omo-tmp/
+_tmp/
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+*.egg-info/
 build/
 dist/
+tools/*.exe
 *.tmp
+*.partial
