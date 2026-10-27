@@ -15,7 +15,7 @@ import pytest
 from quinepack import __version__
 from quinepack import cli
 from quinepack import verify as verify_module
-from quinepack.errors import PayloadError, SevenZipMissingError, VerificationError
+from quinepack.errors import SevenZipMissingError, VerificationError
 from quinepack.model import Payload
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +63,32 @@ def fake_writer(monkeypatch: pytest.MonkeyPatch) -> _FakeWriter:
     module.build_archive = writer  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "quinepack.formats.sevenzip", module)
     return writer
+
+
+@dataclass
+class _TarxzCall:
+    payload: Payload
+    quine_name: str
+    seed_name: str
+
+
+@pytest.fixture
+def fake_tarxz(monkeypatch: pytest.MonkeyPatch) -> list[_TarxzCall]:
+    calls: list[_TarxzCall] = []
+
+    def build(
+        payload: Payload,
+        *,
+        quine_name: str,
+        seed_name: str,
+    ) -> SimpleNamespace:
+        calls.append(_TarxzCall(payload, quine_name, seed_name))
+        return SimpleNamespace(data=b"fake-txz")
+
+    module = types.ModuleType("quinepack.formats.tarxz")
+    module.build_archive = build  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "quinepack.formats.tarxz", module)
+    return calls
 
 
 def _make_dir_payload(base: Path, name: str = "site") -> Path:
@@ -188,22 +214,38 @@ def test_preset_out_of_range(tmp_path: Path) -> None:
     assert cli.main(["pack", str(source), "--format", "7z", "--preset", "10"]) == 2
 
 
-# --- unsupported formats -------------------------------------------------
+# --- format writers -------------------------------------------------------
 
 
-def test_txz_is_not_implemented(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_txz_uses_tarxz_writer(
+    tmp_path: Path, fake_tarxz: list[_TarxzCall]
+) -> None:
     source = tmp_path / "app.txt"
     source.write_bytes(b"hello")
 
-    assert cli.main(["pack", str(source), "--format", "txz"]) == 4
-    assert "not implemented" in capsys.readouterr().err
+    assert cli.main(["pack", str(source), "--format", "txz"]) == 0
+
+    output = tmp_path / "app.txt.tar.xz"
+    assert output.read_bytes() == b"fake-txz"
+    assert fake_tarxz[0].quine_name == "app.txt.tar.xz"
+    assert fake_tarxz[0].seed_name == ".quinepack/app.txt.tar.xz.seed"
 
 
-def test_all_is_not_implemented(tmp_path: Path) -> None:
+def test_all_writes_three_formats(
+    tmp_path: Path,
+    fake_writer: _FakeWriter,
+    fake_tarxz: list[_TarxzCall],
+) -> None:
     source = tmp_path / "app.txt"
     source.write_bytes(b"hello")
 
-    assert cli.main(["pack", str(source), "--format", "all"]) == 4
+    assert cli.main(["pack", str(source), "--format", "all"]) == 0
+
+    assert (tmp_path / "app.txt.7z").read_bytes() == b"fake-archive"
+    assert (tmp_path / "app.txt.store.7z").read_bytes() == b"fake-archive"
+    assert (tmp_path / "app.txt.tar.xz").read_bytes() == b"fake-txz"
+    assert len(fake_writer.calls) == 2
+    assert len(fake_tarxz) == 1
 
 
 # --- successful packs ----------------------------------------------------
@@ -571,17 +613,17 @@ def test_interactive_menu_retries_invalid_input(
     assert fake_writer.calls[0].quine_name == "site.7z"
 
 
-def test_interactive_menu_txz_is_not_implemented(
+def test_interactive_menu_txz_uses_tarxz_writer(
     tmp_path: Path,
-    fake_writer: _FakeWriter,
+    fake_tarxz: list[_TarxzCall],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(cli, "_is_interactive", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": "3")
     root = _make_dir_payload(tmp_path)
 
-    assert cli.main(["pack", str(root)]) == 4
-    assert fake_writer.calls == []
+    assert cli.main(["pack", str(root)]) == 0
+    assert fake_tarxz[0].quine_name == "site.tar.xz"
 
 
 def test_interactive_overwrite_can_skip(
@@ -785,11 +827,11 @@ def test_verify_archive_honours_excludes(
     )
 
 
-def test_verify_archive_rejects_txz(tmp_path: Path) -> None:
+def test_verify_archive_rejects_invalid_txz(tmp_path: Path) -> None:
     archive = tmp_path / "site.tar.xz"
     archive.write_bytes(b"archive-bytes")
 
-    with pytest.raises(PayloadError, match="not implemented"):
+    with pytest.raises(VerificationError, match="cannot extract"):
         verify_module.verify_archive(archive, workdir=tmp_path)
 
 

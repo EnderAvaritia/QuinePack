@@ -6,17 +6,18 @@ QuinePack 把本地文件或目录树转换为「自含压缩包」。解压后�
 
 ## Status
 
-Stage 1 is implemented:
+Stage 2 is implemented:
 
 - `7z`: compressed edition, double-LZMA2 coder chain.
 - `7z-store`: store-only compatibility edition, single LZMA2 coder.
+- `txz`: store-only tar.xz compatibility edition, readable by `xz`/`tar` and verified with Python stdlib `lzma`/`tarfile`.
 - `pack`, `verify`, `version` commands.
-- Deterministic output for the same payload bytes and mtimes.
+- `--format all` and deterministic output for the same payload bytes and mtimes.
 
 Not implemented yet:
 
-- `txz` (store-only tar.xz compatibility edition).
 - Streaming/mmap implementation for the 1 GiB memory target in ADR-0007.
+- PAX tar headers for names beyond ustar's 100-byte name / 155-byte prefix limit.
 - Type/zip variants; ZIP is intentionally unsupported (see ADR-0006).
 
 ## Requirements
@@ -33,11 +34,11 @@ Build a compressed archive next to the input:
 python -m quinepack pack site/ --format 7z
 ```
 
-Build both 7z variants into a directory and verify them:
+Build all three variants into a directory and verify them:
 
 ```bash
 python -m quinepack pack site/ \
-  --format 7z,7z-store \
+  --format all \
   --outdir dist/ \
   --7zr "/path/to/7za" \
   --verify
@@ -69,7 +70,7 @@ python -m pytest -q
 python -m compileall -q quinepack tests
 ```
 
-Stage 1 keeps the whole payload and archive in memory. The 1 GiB streaming design is recorded in `docs/adr/0007-1gib-prototype-baseline.md`.
+Stage 2 keeps the whole payload and archive in memory. The 1 GiB streaming design is recorded in `docs/adr/0007-1gib-prototype-baseline.md`.
 
 ## License
 

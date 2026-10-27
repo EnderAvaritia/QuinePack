@@ -1,20 +1,23 @@
-"""External 7-Zip extraction and archive verification (product spec 6.6)."""
+"""Archive extraction and self-copy/payload verification (product spec 6.6)."""
 
 from __future__ import annotations
 
 import hashlib
+import lzma
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from .errors import PayloadError, SevenZipMissingError, VerificationError
+from .errors import SevenZipMissingError, VerificationError
 from .naming import SEED_DIR, format_from_artifact_name
 from .scan import scan_payload
 
 SEVEN_ZIP_CANDIDATES: tuple[str, ...] = ("7zr", "7z", "7z.exe", "7zr.exe")
+_XZ_MAGIC = b"\xfd7zXZ\x00"
 _CHUNK_SIZE = 1 << 20
 
 
@@ -75,19 +78,55 @@ def verify_archive(
     if not archive_path.is_file():
         raise VerificationError(f"archive not found: {archive_path}")
 
-    if format_from_artifact_name(archive_path.name) == "txz":
-        raise PayloadError("tar.xz verification is not implemented in this build")
-
-    tool = find_seven_zip(seven_zip)
+    format_key = format_from_artifact_name(archive_path.name)
+    if format_key is None and _has_xz_magic(archive_path):
+        format_key = "txz"
     base = Path(workdir) if workdir is not None else archive_path.parent
     base.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix=".quinepack-verify-", dir=base) as tmp:
         extracted = Path(tmp) / "payload"
-        extract_archive(tool, archive_path, extracted)
+        if format_key == "txz":
+            _extract_txz(archive_path, extracted)
+        else:
+            tool = find_seven_zip(seven_zip)
+            extract_archive(tool, archive_path, extracted)
         _verify_self_copy(archive_path, extracted)
         if against is not None:
             _verify_payload(Path(against), extracted, archive_path.name, excludes)
+
+
+def _has_xz_magic(archive: Path) -> bool:
+    try:
+        with open(archive, "rb") as handle:
+            return handle.read(len(_XZ_MAGIC)) == _XZ_MAGIC
+    except OSError:
+        return False
+
+
+def _extract_txz(archive: Path, destination: Path) -> None:
+    """Extract a standard tar.xz stream without an external tool."""
+
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        with lzma.open(archive, "rb") as raw:
+            with tarfile.open(fileobj=raw, mode="r:") as tar:
+                _safe_extract(tar, destination)
+    except (OSError, EOFError, ValueError, lzma.LZMAError, tarfile.TarError) as exc:
+        raise VerificationError(f"cannot extract {archive.name}: {exc}") from exc
+
+
+def _safe_extract(tar: tarfile.TarFile, destination: Path) -> None:
+    root = destination.resolve()
+    for member in tar.getmembers():
+        if not (member.isreg() or member.isdir()):
+            raise VerificationError(
+                f"archive contains an unsupported entry type: {member.name}"
+            )
+        target = (destination / member.name).resolve()
+        if not target.is_relative_to(root):
+            raise VerificationError(f"archive entry escapes destination: {member.name}")
+        tar.extract(member, destination)
 
 
 def _verify_self_copy(archive: Path, extracted: Path) -> None:

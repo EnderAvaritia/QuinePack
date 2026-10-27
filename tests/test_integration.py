@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -148,5 +150,45 @@ def test_verify_subcommand_honors_exclude(tmp_path: Path) -> None:
                 "--quiet",
             ]
         )
+        == 0
+    )
+
+
+def test_pack_all_and_external_txz_acceptance(tmp_path: Path) -> None:
+    xz = shutil.which("xz")
+    tar = shutil.which("tar")
+    if xz is None or tar is None:
+        pytest.skip("xz and tar are not available")
+
+    site = _make_site(tmp_path)
+    outdir = tmp_path / "out"
+
+    assert (
+        cli.main(
+            [
+                "pack",
+                str(site),
+                "--format",
+                "all",
+                "--outdir",
+                str(outdir),
+                "--7zr",
+                str(SEVEN_ZIP),
+                "--verify",
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+
+    txz = outdir / "site.tar.xz"
+    assert txz.is_file()
+    assert subprocess.run([xz, "-t", str(txz)], check=False).returncode == 0
+    assert (
+        subprocess.run(
+            [tar, "--force-local", "-tJf", str(txz)],
+            capture_output=True,
+            check=False,
+        ).returncode
         == 0
     )

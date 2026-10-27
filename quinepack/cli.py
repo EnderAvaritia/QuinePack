@@ -11,7 +11,6 @@ from pathlib import Path
 from . import __version__
 from .errors import (
     ExistsError,
-    PayloadError,
     QuinePackError,
     UsageError,
 )
@@ -159,7 +158,6 @@ def _command_pack(args: argparse.Namespace) -> int:
         formats = _parse_formats(args.formats)
         if args.output is not None and len(formats) != 1:
             raise UsageError("-o/--output requires exactly one format")
-        _require_implemented(formats)
     elif not _is_interactive():
         raise UsageError("--format is required when not running in a terminal")
 
@@ -169,7 +167,6 @@ def _command_pack(args: argparse.Namespace) -> int:
 
     if formats is None:
         formats = _select_formats_interactive(payload)
-        _require_implemented(formats)
 
     planned = _plan_outputs(payload, args.input, formats, args.output, args.outdir)
     selected = _select_targets(planned, reporter, force=args.force)
@@ -178,7 +175,7 @@ def _command_pack(args: argparse.Namespace) -> int:
     if args.preset is not None and any(
         not format_is_compressed(format_key) for format_key, _ in selected
     ):
-        reporter.warning("--preset has no effect on 7z-store")
+        reporter.warning("--preset has no effect on 7z-store or txz")
 
     for format_key, output in selected:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -235,13 +232,6 @@ def _parse_formats(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(raw))
 
 
-def _require_implemented(formats: tuple[str, ...]) -> None:
-    if "txz" in formats:
-        raise PayloadError(
-            "format 'txz' is not implemented in this build; supported formats: 7z, 7z-store"
-        )
-
-
 def _plan_outputs(
     payload: Payload,
     input_path: Path,
@@ -294,18 +284,28 @@ def _build(
     preset: int,
 ) -> bytes:
     try:
-        from .formats.sevenzip import build_archive
-    except ImportError as exc:
-        raise QuinePackError("the 7z writer is not available in this build") from exc
+        if format_key == "txz":
+            from .formats.tarxz import build_archive
 
-    try:
-        result = build_archive(
-            payload,
-            quine_name=artifact,
-            seed_name=seed_name(artifact),
-            compressed=format_is_compressed(format_key),
-            preset=preset,
-        )
+            result = build_archive(
+                payload,
+                quine_name=artifact,
+                seed_name=seed_name(artifact),
+            )
+        else:
+            from .formats.sevenzip import build_archive
+
+            result = build_archive(
+                payload,
+                quine_name=artifact,
+                seed_name=seed_name(artifact),
+                compressed=format_is_compressed(format_key),
+                preset=preset,
+            )
+    except ImportError as exc:
+        raise QuinePackError(
+            f"the {format_key} writer is not available in this build"
+        ) from exc
     except QuinePackError:
         raise
     except Exception as exc:  # noqa: BLE001 - writer failures become runtime errors
@@ -313,7 +313,7 @@ def _build(
 
     data = getattr(result, "data", None)
     if not isinstance(data, (bytes, bytearray)):
-        raise QuinePackError("the 7z writer returned no archive data")
+        raise QuinePackError(f"the {format_key} writer returned no archive data")
     return bytes(data)
 
 
