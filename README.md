@@ -82,6 +82,12 @@ quinepack verify dist/site.tar.xz --against site/
 - `--verify`：写入后立即校验；7z 变体需要外部 7-Zip。
 - `--quiet` / `--verbose`：减少或增加输出。
 
+格式选择建议：
+
+- 需要体积收益：用 `7z`。
+- 文件条目数很多（约 1500 个以上小文件）：用 `7z` 或 `txz`，避免 `7z-store`。
+- 不想依赖 7-Zip：用 `txz`。
+
 ## 输出布局
 
 `--format all` 会生成：
@@ -139,7 +145,7 @@ python -m compileall -q quinepack tests
 
 - 阶段 2 仍为全内存实现，1 GiB 载荷的峰值内存尚未达到 ADR-0007 目标。
 - tar 名称超过 ustar 限制时返回载荷错误（退出码 4），不会截断。
-- `7z-store` 在约 1500 个以上小文件时可能失败：其 gadget 会包含完整 7z header，超过单个 64 KiB store chunk 上限；`7z` 压缩版不受此限制。
+- `7z-store` 在约 1500 个以上小文件时可能失败：其 gadget 会包含完整 7z header，超过单个 64 KiB store chunk 上限，报错形如 `store build failed`。此时改用 `--format 7z` 或 `--format txz`；`7z` 压缩版在 2000 个小文件下已验证正常。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限。
 - 1 GiB 随机载荷的原型基线已测（约 596 s、峰值 16.6 GB），但生产实现仍是全内存；100 MiB 级常规载荷的回归测试尚未系统覆盖。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
 
