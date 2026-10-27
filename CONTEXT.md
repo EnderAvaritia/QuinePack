@@ -1,4 +1,4 @@
-# Selfconbine
+# QuinePack
 
 一个把任意载荷转换为「自含压缩包」的生成器项目。
 
