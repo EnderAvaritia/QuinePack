@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     pack.add_argument(
         "--verify",
         action="store_true",
-        help="verify each archive with external 7-Zip after writing",
+        help="verify each archive after writing (7z formats need external 7-Zip)",
     )
     pack.add_argument("--7zr", dest="seven_zip", metavar="PATH", help="7-Zip executable")
     _add_verbosity(pack)
@@ -109,7 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GLOB",
         help="exclude paths matching GLOB when comparing with --against",
     )
-    verify.add_argument("--7zr", dest="seven_zip", metavar="PATH", help="7-Zip executable")
+    verify.add_argument(
+        "--7zr",
+        dest="seven_zip",
+        metavar="PATH",
+        help="7-Zip executable (required for 7z archives)",
+    )
     _add_verbosity(verify)
 
     subparsers.add_parser("version", help="print the QuinePack version")
