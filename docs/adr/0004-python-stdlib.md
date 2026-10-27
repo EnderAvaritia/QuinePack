@@ -1,4 +1,4 @@
-# 使用 Python 3.14 与标准库实现
+# 使用 Python 3.11+ 与标准库实现
 
 ## Status
 
@@ -10,7 +10,7 @@ accepted
 
 ## Decision
 
-QuinePack 使用 Python 3.14 实现。运行时核心只依赖标准库，不引入第三方运行时依赖；测试可以使用 pytest 等开发依赖。1 GiB 场景通过 mmap、增量 CRC 与分块 token 生成来控制内存与耗时。
+QuinePack 使用 Python 3.11+ 实现，开发与验收环境使用 Python 3.14。运行时核心只依赖标准库，不引入第三方运行时依赖；测试可以使用 pytest 等开发依赖。1 GiB 场景通过 mmap、增量 CRC 与分块 token 生成来控制内存与耗时。
 
 ## Considered Options
 
