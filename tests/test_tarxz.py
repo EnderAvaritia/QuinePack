@@ -15,6 +15,7 @@ import pytest
 from quinepack.errors import PayloadError, VerificationError
 from quinepack.formats.tarxz import (
     BuildResult,
+    _crc64_update,
     build_archive,
     verify_built,
 )
@@ -185,8 +186,16 @@ def test_unicode_names_roundtrip() -> None:
     verify_built(result, payload)
     archive, _ = _tar_members(result)
     with archive:
-        assert archive.getmember("文档/说明.txt").isfile()
+        member = archive.getmember("文档/说明.txt")
+        assert member.isfile()
+        assert member.pax_headers["path"] == "文档/说明.txt"
         assert archive.getmember("文档").isdir()
+
+
+def test_crc64_update_matches_one_pass() -> None:
+    data = bytes(range(256)) * 37
+    split = _crc64_update(0, data[:313])
+    assert _crc64_update(split, data[313:]) == _crc64_update(0, data)
 
 
 def test_build_is_deterministic() -> None:
@@ -213,15 +222,77 @@ def test_build_is_deterministic() -> None:
     assert first.entries == second.entries
 
 
-def test_ustar_name_too_long_raises() -> None:
-    entry = _file("x" * 120, b"data")
+def test_long_name_uses_pax_header() -> None:
+    long_name = "x" * 120
+    entry = _file(long_name, b"data")
     payload = _payload((entry,), single_file=True)
 
-    with pytest.raises(PayloadError, match="too long for POSIX ustar"):
+    result = build_archive(
+        payload,
+        quine_name="long.tar.xz",
+        seed_name=".quinepack/long.tar.xz.seed",
+    )
+
+    verify_built(result, payload)
+    archive, _ = _tar_members(result)
+    with archive:
+        member = archive.getmember(long_name)
+        assert member.isfile()
+        assert member.pax_headers["path"] == long_name
+        assert archive.extractfile(long_name).read() == b"data"
+
+
+def test_long_nested_name_uses_pax_header() -> None:
+    long_name = "/".join(["a" * 90, "b" * 90, "c" * 90 + ".bin"])
+    assert len(long_name.encode("utf-8")) > 255
+    entry = _file(long_name, b"nested")
+    payload = _payload((entry,), single_file=True)
+
+    result = build_archive(
+        payload,
+        quine_name="long.compressed.tar.xz",
+        seed_name=".quinepack/long.compressed.tar.xz.seed",
+    )
+
+    verify_built(result, payload)
+    archive, _ = _tar_members(result)
+    with archive:
+        assert archive.getmember(long_name).isfile()
+
+
+def test_long_artifact_and_seed_names_use_pax() -> None:
+    artifact = "payload-" + "z" * 120 + ".tar.xz"
+    seed = f".quinepack/{artifact}.seed"
+    payload = _payload((_file("tiny.txt", b"tiny"),), single_file=True)
+
+    result = build_archive(payload, quine_name=artifact, seed_name=seed)
+
+    verify_built(result, payload)
+    assert result.entries[0] == (seed, False)
+    assert result.entries[-1] == (artifact, False)
+
+
+def test_pax_needed_name_with_newline_is_rejected() -> None:
+    entry = _file("x" * 120 + "\n", b"data")
+    payload = _payload((entry,), single_file=True)
+
+    with pytest.raises(PayloadError, match="PAX"):
         build_archive(
             payload,
             quine_name="long.tar.xz",
             seed_name=".quinepack/long.tar.xz.seed",
+        )
+
+
+def test_name_with_nul_is_rejected() -> None:
+    entry = _file("bad\x00name", b"data")
+    payload = _payload((entry,), single_file=True)
+
+    with pytest.raises(PayloadError, match="NUL"):
+        build_archive(
+            payload,
+            quine_name="bad.tar.xz",
+            seed_name=".quinepack/bad.tar.xz.seed",
         )
 
 
@@ -231,11 +302,14 @@ def test_external_xz_and_tar_accept_archive() -> None:
     if xz is None or tar is None:
         pytest.skip("xz and tar executables are both required")
 
+    long_name = "/".join(["long-" + "a" * 80, "b" * 90, "c" * 90 + ".txt"])
+
     payload = _payload(
         (
             _dir("docs"),
             _file("docs/readme.txt", b"quinepack external test\n" * 40, MTIME_B),
             _file("empty.txt", b"", MTIME_A),
+            _file(long_name, b"pax long path\n", MTIME_A),
         ),
         single_file=False,
     )
@@ -279,6 +353,7 @@ def test_external_xz_and_tar_accept_archive() -> None:
         listed = set(tar_check.stdout.split())
         assert "site.tar.xz" in listed
         assert "docs/readme.txt" in listed
+        assert long_name in listed
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

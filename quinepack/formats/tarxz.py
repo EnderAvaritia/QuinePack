@@ -38,6 +38,7 @@ from ..lzma2 import (
     store_hdr,
 )
 from ..model import Payload, PayloadEntry
+from ..progress import report
 from .sevenzip import BuildResult
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,7 @@ _XZ_FLAGS = bytes([0x00, XZ_CHECK_CRC64])
 
 TAR_BLOCK = 512
 SEED_NOTE = b"\nQuinePack seed"
+PAX_HEADER_NAME = "PaxHeaders/QuinePack"
 
 # Difference between the xz block header size and the first chunk offset.
 # The block header is 12 bytes for the single LZMA2 filter used here.
@@ -72,7 +74,6 @@ def _crc32(data: bytes) -> int:
 # ---------------------------------------------------------------------------
 
 _CRC64_POLY = 0xC96C5795D7870F42  # reflected ECMA-182
-_CRC64_INIT = 0xFFFFFFFFFFFFFFFF
 _CRC64_XOROUT = 0xFFFFFFFFFFFFFFFF
 _CRC64_NON_REFLECTED = 0x142F0E1EBA9EA3693
 _CRC64_MOD_BIT = 1 << 64
@@ -83,7 +84,7 @@ try:
     if _lzma_name:
         _candidate = ctypes.CDLL(_lzma_name)
         _candidate.lzma_crc64.argtypes = [
-            ctypes.c_char_p,
+            ctypes.c_void_p,
             ctypes.c_size_t,
             ctypes.c_uint64,
         ]
@@ -107,19 +108,62 @@ def _make_crc64_table() -> list[int]:
 _CRC64_TABLE = _make_crc64_table()
 
 
-def _crc64_pure(data: bytes) -> int:
-    crc = _CRC64_INIT
-    for byte in data:
-        crc = (crc >> 8) ^ _CRC64_TABLE[(crc ^ byte) & 0xFF]
-    return crc ^ _CRC64_XOROUT
+def _make_crc64_slice_tables() -> list[list[int]]:
+    """Eight byte-position tables for slice-by-8 CRC64 updates."""
+    tables = [_CRC64_TABLE]
+    for _ in range(7):
+        previous = tables[-1]
+        tables.append([(value >> 8) ^ _CRC64_TABLE[value & 0xFF] for value in previous])
+    return tables
 
 
-def _crc64_lib(data: bytes) -> int:
-    return int(_liblzma.lzma_crc64(data, len(data), 0))  # type: ignore[union-attr]
+_CRC64_SLICE = _make_crc64_slice_tables()
 
 
-def _crc64(data: bytes) -> int:
-    return _crc64_lib(data) if _liblzma is not None else _crc64_pure(data)
+def _crc64_pure_update(state: int, data: bytes | bytearray) -> int:
+    """Update a raw CRC64 state, eight bytes at a time."""
+    length = len(data)
+    offset = 0
+    tables = _CRC64_SLICE
+    while length - offset >= 8:
+        value = state ^ int.from_bytes(data[offset : offset + 8], "little")
+        state = (
+            tables[7][value & 0xFF]
+            ^ tables[6][(value >> 8) & 0xFF]
+            ^ tables[5][(value >> 16) & 0xFF]
+            ^ tables[4][(value >> 24) & 0xFF]
+            ^ tables[3][(value >> 32) & 0xFF]
+            ^ tables[2][(value >> 40) & 0xFF]
+            ^ tables[1][(value >> 48) & 0xFF]
+            ^ tables[0][(value >> 56) & 0xFF]
+        )
+        offset += 8
+    table = _CRC64_TABLE
+    while offset < length:
+        state = (state >> 8) ^ table[(state ^ data[offset]) & 0xFF]
+        offset += 1
+    return state
+
+
+def _crc64_update(value: int, data: bytes | bytearray) -> int:
+    """Extend a finished CRC64 value with more bytes."""
+    if _liblzma is not None:
+        if isinstance(data, bytes):
+            pointer = ctypes.c_char_p(data)
+        else:
+            pointer = ctypes.cast(
+                (ctypes.c_char * len(data)).from_buffer(data), ctypes.c_void_p
+            )
+        return int(_liblzma.lzma_crc64(pointer, len(data), value))
+    state = _crc64_pure_update(value ^ _CRC64_XOROUT, data)
+    return state ^ _CRC64_XOROUT
+
+
+def _crc64_parts(parts) -> int:
+    value = 0
+    for part in parts:
+        value = _crc64_update(value, part)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +255,50 @@ def _split_ustar_name(name: bytes) -> tuple[bytes, bytes]:
     )
 
 
+def _fits_ustar(name: str) -> bool:
+    try:
+        _split_ustar_name(name.encode("utf-8"))
+    except ValueError:
+        return False
+    return True
+
+
+def _needs_pax(name: str) -> bool:
+    """PAX is required for long names and to carry non-ASCII UTF-8 paths."""
+    return not _fits_ustar(name) or not name.isascii()
+
+
+def _truncate_utf8(value: bytes, limit: int) -> bytes:
+    """Truncate UTF-8 bytes without splitting a multi-byte sequence."""
+    if len(value) <= limit:
+        return value
+    cut = limit
+    while cut > 0 and (value[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return value[:cut]
+
+
+def _header_name(name: str) -> tuple[bytes, bytes]:
+    """Return ustar name/prefix fields; fall back to a placeholder for PAX."""
+    raw = name.encode("utf-8")
+    try:
+        return _split_ustar_name(raw)
+    except ValueError:
+        base = raw.rsplit(b"/", 1)[-1] or raw
+        return _truncate_utf8(base, 100), b""
+
+
+def _pax_path_record(name: str) -> bytes:
+    """Encode one ``path`` PAX record whose length includes its own digits."""
+    body = b" path=" + name.encode("utf-8") + b"\n"
+    length = len(body) + 1
+    while True:
+        digits = len(str(length))
+        if digits + len(body) == length:
+            return str(length).encode("ascii") + body
+        length = digits + len(body)
+
+
 def _octal_field(value: int, digits: int, label: str) -> bytes:
     if value < 0 or value >= 8**digits:
         raise ValueError(f"{label} does not fit a {digits}-digit tar octal field: {value}")
@@ -225,8 +313,7 @@ def _tar_header(
     typeflag: bytes = b"0",
 ) -> bytes:
     """Build a 512-byte POSIX ustar header."""
-    name_bytes = name.encode("utf-8")
-    name_field, prefix_field = _split_ustar_name(name_bytes)
+    name_field, prefix_field = _header_name(name)
 
     header = bytearray(TAR_BLOCK)
     header[0 : len(name_field)] = name_field
@@ -355,7 +442,6 @@ class _TarXzBuilder:
             (entry.path, entry.data or b"") for entry in payload.files
         )
         self.file_map = dict(self.files)
-        self.content = payload.content
         self.generated_mtime = (
             self.entries[0].mtime_ns // 1_000_000_000 if self.entries else 0
         )
@@ -367,75 +453,124 @@ class _TarXzBuilder:
 
     def tar_entries(self, d_seed: int, xz_size: int) -> list[dict[str, object]]:
         entries: list[dict[str, object]] = []
-        seed_header = _tar_header(
-            self.seed_name, d_seed, self.generated_mtime, mode=0o644
-        )
-        entries.append(
-            {
-                "name": self.seed_name,
-                "hdr": seed_header,
-                "data_size": d_seed,
-                "is_dir": False,
-            }
+        entries.extend(
+            self._tar_entry(
+                self.seed_name,
+                d_seed,
+                self.generated_mtime,
+                mode=0o644,
+            )
         )
 
         for entry in self.entries:
             mtime = self._entry_mtime(entry)
             if entry.is_dir:
-                header = _tar_header(
-                    entry.path,
-                    0,
-                    mtime,
-                    mode=entry.mode,
-                    typeflag=b"5",
-                )
-                entries.append(
-                    {
-                        "name": entry.path,
-                        "hdr": header,
-                        "data_size": 0,
-                        "is_dir": True,
-                    }
+                entries.extend(
+                    self._tar_entry(
+                        entry.path,
+                        0,
+                        mtime,
+                        mode=entry.mode,
+                        typeflag=b"5",
+                        is_dir=True,
+                    )
                 )
             else:
                 data = entry.data or b""
-                header = _tar_header(
-                    entry.path,
-                    len(data),
-                    mtime,
-                    mode=entry.mode,
-                )
-                entries.append(
-                    {
-                        "name": entry.path,
-                        "hdr": header,
-                        "data_size": len(data),
-                        "is_dir": False,
-                    }
+                entries.extend(
+                    self._tar_entry(
+                        entry.path,
+                        len(data),
+                        mtime,
+                        mode=entry.mode,
+                    )
                 )
 
-        quine_header = _tar_header(
-            self.quine_name, xz_size, self.generated_mtime, mode=0o644
-        )
-        entries.append(
-            {
-                "name": self.quine_name,
-                "hdr": quine_header,
-                "data_size": xz_size,
-                "is_dir": False,
-            }
+        entries.extend(
+            self._tar_entry(
+                self.quine_name,
+                xz_size,
+                self.generated_mtime,
+                mode=0o644,
+            )
         )
         return entries
 
+    def _tar_entry(
+        self,
+        name: str,
+        data_size: int,
+        mtime: int,
+        *,
+        mode: int,
+        typeflag: bytes = b"0",
+        is_dir: bool = False,
+        data: bytes | None = None,
+    ) -> list[dict[str, object]]:
+        """Return the tar blocks for one member, plus a PAX header if needed."""
+        result: list[dict[str, object]] = []
+        if _needs_pax(name):
+            record = _pax_path_record(name)
+            result.append(
+                {
+                    "name": PAX_HEADER_NAME,
+                    "hdr": _tar_header(
+                        PAX_HEADER_NAME,
+                        len(record),
+                        mtime,
+                        mode=0o644,
+                        typeflag=b"x",
+                    ),
+                    "data_size": len(record),
+                    "is_dir": False,
+                    "data": record,
+                    "pax": True,
+                }
+            )
+        result.append(
+            {
+                "name": name,
+                "hdr": _tar_header(
+                    name,
+                    data_size,
+                    mtime,
+                    mode=mode,
+                    typeflag=typeflag,
+                ),
+                "data_size": data_size,
+                "is_dir": is_dir,
+                "data": data,
+                "pax": False,
+            }
+        )
+        return result
+
+    def public_entries(
+        self, entries: list[dict[str, object]]
+    ) -> tuple[tuple[str, bool], ...]:
+        """Archive members without the synthetic PAX header entries."""
+        return tuple(
+            (str(entry["name"]), bool(entry["is_dir"]))
+            for entry in entries
+            if not entry.get("pax")
+        )
+
+    def _seed_data_offset(self) -> int:
+        """Tar offset where the seed data starts, after any PAX header."""
+        offset = TAR_BLOCK
+        if _needs_pax(self.seed_name):
+            record = _pax_path_record(self.seed_name)
+            offset += TAR_BLOCK + _round_up_512(len(record))
+        return offset
+
     def _compute_q(self, d_seed: int) -> int:
         """Offset of the xz stream inside the tar stream."""
-        q = TAR_BLOCK + _round_up_512(d_seed)
-        for entry in self.entries:
-            q += TAR_BLOCK
-            if not entry.is_dir:
-                q += _round_up_512(len(entry.data or b""))
-        q += TAR_BLOCK
-        return q
+        entries = self.tar_entries(d_seed, 0)
+        q = sum(
+            TAR_BLOCK + _round_up_512(int(entry["data_size"]))
+            for entry in entries[:-1]
+        )
+        return q + TAR_BLOCK
 
     # -- layout ------------------------------------------------------------
 
@@ -447,6 +582,7 @@ class _TarXzBuilder:
         q: int,
         plant_offset: int,
         d_seed: int,
+        seed_data_offset: int,
     ) -> list[tuple[list[dict[str, object]], int, int, int, bytes]]:
         """Enumerate phase-shifting trim configurations.
 
@@ -495,7 +631,7 @@ class _TarXzBuilder:
                 jump_length = next_length
             if jump_block is None or unpacked != jump_length:
                 continue
-            if jump_length + plant_offset - TAR_BLOCK > d_seed:
+            if jump_length + plant_offset - seed_data_offset > d_seed:
                 continue
 
             key = (output_pos + jump_length, file_pos + len(jump_block))
@@ -684,13 +820,18 @@ class _TarXzBuilder:
         # dictionary must be sized from q; using len(content) alone corrupts
         # archives with many tiny entries.
         q = self._compute_q(d_seed)
+        seed_data_offset = self._seed_data_offset()
         distance_hint = 2 * (q + _BLOCK_HEADER_SIZE + 12 + 3)
         block_header, dict_size = _xz_block_header(distance_hint)
         block_header_size = len(block_header)
         few = _BLOCK_HEADER_SIZE + block_header_size + 3
-        header_a_offset = TAR_BLOCK + _BLOCK_HEADER_SIZE + block_header_size
+        header_a_offset = (
+            seed_data_offset + _BLOCK_HEADER_SIZE + block_header_size
+        )
         header_b_offset = header_a_offset + 3
-        plant_offset = TAR_BLOCK + _BLOCK_HEADER_SIZE + block_header_size + 6
+        plant_offset = (
+            seed_data_offset + _BLOCK_HEADER_SIZE + block_header_size + 6
+        )
 
         # Consume the tar prefix plus the first few xz bytes into store chunks.
         base: list[dict[str, object]] = []
@@ -785,7 +926,7 @@ class _TarXzBuilder:
             jump_length,
             jump_block,
         ) in self._trim_layouts(
-            base, output_gear, file_gear, q, plant_offset, d_seed
+            base, output_gear, file_gear, q, plant_offset, d_seed, seed_data_offset
         ):
             layout = self._solve_gadget(
                 chunks_before,
@@ -824,6 +965,7 @@ class _TarXzBuilder:
     # -- assembly ----------------------------------------------------------
 
     def assemble(self, layout: dict[str, object]) -> tuple[bytes, bytes]:
+        report("assembling")
         archive = bytearray(int(layout["xz_size"]))
         q = int(layout["q"])
         d_seed = int(layout["d_seed"])
@@ -897,9 +1039,8 @@ class _TarXzBuilder:
         ] = padding
 
         tar_prefix = self._build_tar_prefix(layout, seed)
-        prefix = tar_prefix + bytes(archive[0:few])
-        assert len(prefix) == q + few, (
-            f"tar prefix length {len(prefix)} != {q + few}"
+        assert len(tar_prefix) == q, (
+            f"tar prefix length {len(tar_prefix)} != {q}"
         )
 
         for chunk in layout["chunks"]:
@@ -908,9 +1049,9 @@ class _TarXzBuilder:
             output_offset = int(chunk["ooff"])
             length = int(chunk["olen"])
             if chunk.get("c1"):
-                archive[
-                    chunk["foff"] + 3 : chunk["foff"] + 3 + length
-                ] = prefix[chunk["S"] : chunk["S"] + length]
+                self._copy_prefix(
+                    archive, chunk["foff"] + 3, int(chunk["S"]), length, tar_prefix
+                )
             elif chunk.get("trailing"):
                 # The payload is the zero tail after the archive and the
                 # bytearray is already zero-initialized.
@@ -923,8 +1064,29 @@ class _TarXzBuilder:
                     chunk["foff"] + 3 : chunk["foff"] + 3 + length
                 ] = archive[start : start + length]
 
+        report("fixing CRCs")
         self._solve_crc64(archive, layout, tar_prefix)
-        return bytes(archive), bytes(seed)
+        return archive, bytes(seed)
+
+    def _copy_prefix(
+        self,
+        archive: bytearray,
+        target: int,
+        source: int,
+        length: int,
+        tar_prefix: bytes,
+    ) -> None:
+        """Copy from ``tar_prefix + archive[0:few]`` without joining them."""
+        prefix_length = len(tar_prefix)
+        if source < prefix_length:
+            piece = min(length, prefix_length - source)
+            archive[target : target + piece] = tar_prefix[source : source + piece]
+            target += piece
+            length -= piece
+            source += piece
+        if length > 0:
+            start = source - prefix_length
+            archive[target : target + length] = archive[start : start + length]
 
     def _build_tar_prefix(
         self, layout: dict[str, object], seed: bytes
@@ -934,11 +1096,13 @@ class _TarXzBuilder:
         for entry in entries[:-1]:
             prefix += entry["hdr"]
             if not entry["is_dir"] and entry["data_size"] > 0:
-                data = (
-                    seed
-                    if entry["name"] == self.seed_name
-                    else self.file_map[entry["name"]]
-                )
+                data = entry.get("data")
+                if data is None:
+                    data = (
+                        seed
+                        if entry["name"] == self.seed_name
+                        else self.file_map[entry["name"]]
+                    )
                 prefix += data
                 prefix += b"\x00" * (
                     _round_up_512(entry["data_size"]) - entry["data_size"]
@@ -968,14 +1132,28 @@ class _TarXzBuilder:
 
         xz_pad = _round_up_512(xz_size)
         trailing = xz_pad - xz_size + 1024
-        stream = bytearray(tar_prefix) + archive + b"\x00" * trailing
-        stream[crc_w1 : crc_w1 + CHECK_SIZE] = b"\x00" * CHECK_SIZE
-        stream[crc_w2 : crc_w2 + CHECK_SIZE] = b"\x00" * CHECK_SIZE
+        stream_length = q + xz_size + trailing
+        crc_w1 = q + crc_offset
+        crc_w2 = q + crc_offset - total
+        zeros = b"\x00" * trailing
+        slots = (bytes(archive[crc_offset : crc_offset + CHECK_SIZE]), bytes(
+            archive[crc_offset - total : crc_offset - total + CHECK_SIZE]
+        ))
+        archive[crc_offset : crc_offset + CHECK_SIZE] = b"\x00" * CHECK_SIZE
+        archive[
+            crc_offset - total : crc_offset - total + CHECK_SIZE
+        ] = b"\x00" * CHECK_SIZE
+        crc_poly = _bit_reverse64(
+            _crc64_parts((tar_prefix, archive, zeros))
+        )
+        archive[crc_offset : crc_offset + CHECK_SIZE] = slots[0]
+        archive[
+            crc_offset - total : crc_offset - total + CHECK_SIZE
+        ] = slots[1]
 
-        crc_poly = _bit_reverse64(_crc64(bytes(stream)))
-        trailing1 = (len(stream) - crc_w1 - 8) * 8
+        trailing1 = (stream_length - crc_w1 - 8) * 8
         p1 = _poly_pow(2, 64 + trailing1)
-        trailing2 = (len(stream) - crc_w2 - 8) * 8
+        trailing2 = (stream_length - crc_w2 - 8) * 8
         p2 = _poly_pow(2, 64 + trailing2)
 
         inverse = _poly_minv(1 ^ p1 ^ p2)
@@ -989,12 +1167,14 @@ class _TarXzBuilder:
         )
         _forward_vac(archive, vac, q)
 
-        check = bytearray(tar_prefix) + archive + b"\x00" * trailing
-        assert _crc64(bytes(check)) == value, "CRC64 fixpoint verification failed"
+        assert (
+            _crc64_parts((tar_prefix, archive, zeros)) == value
+        ), "CRC64 fixpoint verification failed"
 
     # -- public build ------------------------------------------------------
 
     def build(self) -> tuple[bytes, dict[str, object], bytes]:
+        report("laying out")
         last_error: Exception | None = None
         seed_sizes = (
             64,
@@ -1039,15 +1219,17 @@ def _public_layout(layout: dict[str, object]) -> dict[str, object]:
 def _validate_tar_names(
     payload: Payload, quine_name: str, seed_name: str
 ) -> None:
-    """Reject names that POSIX ustar cannot represent before doing any work."""
+    """Reject names that tar or the PAX record format cannot carry."""
     names = [seed_name]
     names.extend(entry.path for entry in payload.entries)
     names.append(quine_name)
     for name in names:
-        try:
-            _split_ustar_name(name.encode("utf-8"))
-        except ValueError as exc:
-            raise PayloadError(str(exc)) from exc
+        if "\x00" in name:
+            raise PayloadError(f"tar entry name contains a NUL byte: {name!r}")
+        if _needs_pax(name) and "\n" in name:
+            raise PayloadError(
+                f"tar entry name needs PAX but contains a newline: {name!r}"
+            )
 
 
 def build_archive(
@@ -1062,10 +1244,7 @@ def build_archive(
     data, layout, seed = builder.build()
     return BuildResult(
         data=data,
-        entries=tuple(
-            (entry["name"], bool(entry["is_dir"]))
-            for entry in layout["entries"]
-        ),
+        entries=builder.public_entries(layout["entries"]),
         files=builder.files,
         seed=seed,
         layout=_public_layout(layout),
