@@ -113,7 +113,7 @@ Select output format(s):
 - `--preset N`：0–9，默认 6，只影响压缩型 7z；与其他格式同用时给出警告。
 - `--exclude GLOB`：可重复，相对于载荷根目录的 glob；命中目录时整棵剪枝。
 - `--verify`：生成后立刻用原载荷校验产物。
-- `--7zr PATH`：显式指定 7-Zip 可执行文件；未指定时依次在 PATH 中查找 `7zr`、`7z`、`7z.exe`、`7zr.exe`。
+- `--7zr PATH`：显式指定 7-Zip 可执行文件；未指定时依次在 PATH 中查找 `7zr`、`7z`、`7z.exe`、`7zr.exe`，Windows 上再回退到 `Program Files` / `%LOCALAPPDATA%` 的标准 7-Zip 安装目录。
 - `--quiet` 抑制进度，仅保留错误；`--verbose` 输出阶段细节；两者同时使用报错。
 
 ### 6.6 verify 子命令

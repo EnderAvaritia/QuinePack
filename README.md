@@ -6,26 +6,40 @@
 
 ## 状态
 
-阶段 2 已实现：
+阶段 3 已实现：
 
 - `7z`：压缩版，双层 LZMA2 coder chain。
 - `7z-store`：兼容版，单层 LZMA2 store。
 - `txz`：兼容版，store-only tar.xz，可用 `xz` / `tar` 读取，并用 Python 标准库 `lzma` / `tarfile` 校验。
+- `txz` 对超出 ustar 的 100 字节 name / 155 字节 prefix 限制的名称，以及包含非 ASCII 字符的名称，写入 PAX 扩展头；长载荷路径、Unicode 文件名、长产物名与种子名均可往返。
 - `pack`、`verify`、`version` 三个命令。
 - `--format all` 可一次生成三种产物。
-- 相同载荷字节与 mtime 下，产物确定。
+- 相同载荷字节与 mtime 下，产物确定；打包阶段进度输出到 stderr，并对大小写不敏感的路径冲突给出警告。
+- 验收测试会调用本机官方 7-Zip 与 `xz` / `tar`（存在时）。
+
+Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
+
+| 载荷 | `7z` | `7z-store` | `txz` |
+|---|---:|---:|---:|
+| 64 MiB | 789 MiB / 48 s | 149 MiB / 9 s | 277 MiB / 43 s |
+| 256 MiB | 1448 MiB / 239 s | 538 MiB / 35 s | 1050 MiB / 167 s |
+| 1 GiB | 4155 MiB / 986 s | 2094 MiB / 145 s | 4141 MiB / 688 s |
+
+每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
 尚未实现：
 
-- 面向 1 GiB 载荷的流式 / mmap 写入；当前仍把载荷与归档保存在内存中，见 `docs/adr/0007-1gib-prototype-baseline.md`。
-- tar PAX 长路径；当前受 ustar 的 100 字节 name / 155 字节 prefix 限制。
-- ZIP 变体；ZIP 已明确不支持，见 `docs/adr/0006-no-zip.md`。
+- 流式 / mmap 写入：载荷与归档仍保存在内存中，只是消除了多份整档副本，1 GiB 载荷仍需数 GiB 空闲内存。
+- 压缩版 tar.xz（ADR-0002 限定为 store-only）。
+- 超过 1 GiB 的载荷（ADR-0003）。
+- ZIP 变体（ADR-0006）。
+- `path` 之外的 PAX 记录（mtime 纳秒、超大文件大小、xattr 均不携带）。
 
 ## 环境要求
 
 - Python 3.11 或更高版本。
 - 运行时无第三方依赖。
-- 仅校验 `7z` / `7z-store` 时需要官方 7-Zip（`7z`、`7zr`，或 `--7zr PATH`）。
+- 仅校验 `7z` / `7z-store` 时需要官方 7-Zip（`7z`、`7zr`、标准 Windows 安装目录，或 `--7zr PATH`）。
 - `txz` 的生成与校验不需要 7-Zip。
 
 ## 安装
@@ -112,6 +126,8 @@ site/
 
 `7z-store` 与 `txz` 的目录结构相同，只是自含副本和种子文件名分别对应 `site.store.7z`、`site.tar.xz`。
 
+`tar.xz` 在成员名无法放入 ustar 字段或包含非 ASCII 字符时，会在该成员前写入 PAX 扩展头。长载荷路径、Unicode 文件名与长产物名因此可以经 GNU `tar`、BusyBox `tar` 与 Python `tarfile` 往返。
+
 **种子（Seed）** 是重建自含副本所需的脚手架数据，不属于载荷；解压后可以删除。不要把它当作随机种子、密钥或第二份载荷。
 
 ## 退出码
@@ -131,22 +147,27 @@ site/
 ```bash
 python -m pytest -q
 python -m compileall -q quinepack tests
+python tools/bench_memory.py --size 256 --format 7z
 ```
 
 当前测试覆盖：
 
 - 7z / 7z-store / txz 的生成与校验。
-- 空文件、空目录、Unicode 文件名、ustar prefix。
+- 空文件、空目录、Unicode 文件名、ustar prefix 与 PAX 长名称。
 - 自含副本 SHA-256、CRC64 fixpoint、确定性重复构建。
 - 路径穿越、符号链接、硬链接、设备/FIFO 等不安全 tar 成员。
 - `--format all`、`-o` 自定义文件名、非 TTY 保护与 `.partial` 原子写入。
 
+测试套件会从 `PATH` 或标准 7-Zip 安装目录查找 `7z` / `7zr` 运行官方验收用例；找不到时跳过并给出提示。仅当 `xz` 与 `tar` 都缺失时，才跳过对应验收用例。
+
+阶段 3 仍为全内存实现。峰值内存由载荷、压缩副本、种子与输出归档共同构成，见上表与 `docs/adr/0007-1gib-prototype-baseline.md`。
+
 ## 已知限制
 
-- 阶段 2 仍为全内存实现，1 GiB 载荷的峰值内存尚未达到 ADR-0007 目标。
-- tar 名称超过 ustar 限制时返回载荷错误（退出码 4），不会截断。
+- 仍为全内存实现：内存随载荷增长，只是不再构造多份整档副本；流式 / mmap 尚未实现。
+- 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
 - `7z-store` 在约 1500 个以上小文件时可能失败：其 gadget 会包含完整 7z header，超过单个 64 KiB store chunk 上限，报错形如 `store build failed`。此时改用 `--format 7z` 或 `--format txz`；`7z` 压缩版在 2000 个小文件下已验证正常。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限。
-- 1 GiB 随机载荷的原型基线已测（约 596 s、峰值 16.6 GB），但生产实现仍是全内存；100 MiB 级常规载荷的回归测试尚未系统覆盖。
+- 1 GiB 随机载荷在生产实现下实测约 986 s、峰值约 4.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
 
 ## 许可证

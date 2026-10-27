@@ -55,3 +55,34 @@ V1 保留 1 GiB 硬上限，但生产实现必须：
 ## 后续实现注意
 
 - 当前 7z writer 的 layout 每轮定点都会重建整个 token 流与 mseg，复杂度约为 O(archive)；这是阶段一可接受、1 GiB 生产实现必须消除的热点。
+
+## 生产实现实测（Stage 3，2026-10-28）
+
+Windows 10 x64、64 GiB RAM、Python 3.12.4，官方 7-Zip 23.01 验收。载荷为 `os.urandom` 生成的不可压缩随机字节，命令为 `python tools/bench_memory.py --size <MiB> --format <fmt>`。
+
+| 载荷 | 格式 | 耗时 | 峰值工作集 | 产物 |
+|---|---:|---:|---:|---:|
+| 64 MiB | 7z | 48 s | 789 MiB | 67,383,904 B |
+| 64 MiB | 7z-store | 9 s | 149 MiB | 67,319,940 B |
+| 64 MiB | txz | 43 s | 277 MiB | 67,323,780 B |
+| 256 MiB | 7z | 239 s | 1448 MiB | 269,549,780 B |
+| 256 MiB | 7z-store | 35 s | 538 MiB | 269,285,368 B |
+| 256 MiB | txz | 167 s | 1050 MiB | 269,288,952 B |
+| 1 GiB | 7z | 986 s | 4155 MiB | 1,078,228,942 B |
+| 1 GiB | 7z-store | 145 s | 2094 MiB | 1,077,171,500 B |
+| 1 GiB | txz | 688 s | 4141 MiB | 1,077,175,216 B |
+
+关键改动：
+
+- 单文件载荷不再做第二次 `join`；tar.xz 去掉未使用的载荷副本。
+- 压缩输入按 1 MiB 分块送入 LZMA 压缩器，输出直接写入 `bytearray`，不再产生整份压缩副本。
+- tar.xz 的 CRC64 改为增量计算（slice-by-8，必要时走 liblzma），不再拼接整条 tar 流；c1 store chunk 直接从 tar 前缀和归档头部按块复制。
+- 7z 装配直接按块从 seed/content/头部复制，不再构造 `seed + content + header` 的整份副本；双层 LZMA2 的 plant 不再拼接为独立 bytes，seed 一次预分配写入。
+- mseg token 按 LZMA2 单块上限即时编码，不再把整条 token 流保存在内存；双层布局缓存收敛后的 streams/mseg，`finalize` 直接复用。
+- 压缩输出与归档数据以 `bytearray` 传递，避免最后再复制一整份产物。
+
+结论：
+
+- 1 GiB 随机载荷峰值 4.1 GB，低于本文的 ≤8 GB 目标；不需要把默认上限降到 512 MiB。
+- 耗时约 986 s，高于原型的 596 s。主要成本是纯 Python LZMA2 token 编码，以及双层布局定点约 7 轮、每轮重建整条 mseg；这与上面的“后续实现注意”一致。
+- 本轮没有改成流式/mmap：内存仍然随载荷增长，只是消除了多份整档副本。若要把上限提高或支持 8 GB 以下内存机器，仍需按本文“生产重写计划”落盘。
