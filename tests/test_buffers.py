@@ -159,3 +159,42 @@ def test_compact_7z_matches_seeded_build(
     assert compact.seed == b""
     assert list(tmp_path.glob(".quinepack-spool-*")) == []
 
+
+def test_compact_7z_multifile_matches_seeded_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(scan, "SPOOL_THRESHOLD", 0)
+    monkeypatch.setattr(sevenzip, "SPOOL_THRESHOLD", 0)
+    source = tmp_path / "payload"
+    source.mkdir()
+    _write(source / "a.bin", bytes(range(256)) * 1024)
+    _write(source / "b.bin", bytes(reversed(range(256))) * 1024)
+
+    payload = scan_payload(source)
+    try:
+        normal = sevenzip.build_archive(
+            payload,
+            quine_name="payload.7z",
+            seed_name=".quinepack/payload.7z.seed",
+            compressed=True,
+        )
+    finally:
+        payload.close()
+
+    payload = scan_payload(source)
+    try:
+        compact = sevenzip.build_archive(
+            payload,
+            quine_name="payload.7z",
+            seed_name=".quinepack/payload.7z.seed",
+            compressed=True,
+            release_payload=True,
+        )
+    finally:
+        payload.close()
+
+    assert compact.data == normal.data
+    assert compact.seed == b""
+    assert list(tmp_path.glob(".quinepack-spool-*")) == []
+
