@@ -283,17 +283,54 @@ def test_store_accepts_footer_at_chunk_limit() -> None:
     assert int(result.layout["T"]) <= CHUNK
 
 
-def test_store_rejects_header_above_store_chunk() -> None:
-    entries = tuple(_file(f"f{index:05d}.txt", b"x") for index in range(2000))
+@pytest.mark.parametrize("count", (2000, 5000))
+def test_store_accepts_large_footer(count: int) -> None:
+    entries = tuple(_file(f"f{index:05d}.txt", b"x") for index in range(count))
     payload = _payload(entries, single_file=False)
 
-    with pytest.raises(RuntimeError, match="7z-store cannot encode .* entries: footer is .* above the 65536-byte"):
-        build_archive(
-            payload,
-            quine_name="many.store.7z",
-            seed_name=".quinepack/many.store.7z.seed",
-            compressed=False,
-        )
+    result = build_archive(
+        payload,
+        quine_name="many.store.7z",
+        seed_name=".quinepack/many.store.7z.seed",
+        compressed=False,
+    )
+
+    verify_built(result, payload)
+    assert int(result.layout["T"]) > CHUNK
+
+    if SEVEN_ZIP is not None:
+        scratch = REPO_ROOT / "_tmp"
+        archive = Path(tempfile.mkdtemp(prefix="sevenzip-many-", dir=scratch))
+        try:
+            path = archive / "many.store.7z"
+            path.write_bytes(result.data)
+            completed = subprocess.run(
+                [str(SEVEN_ZIP), "t", str(path)],
+                cwd=archive,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+        finally:
+            shutil.rmtree(archive, ignore_errors=True)
+
+
+def test_store_large_footer_with_payload() -> None:
+    entries = tuple(_file(f"f{index:05d}.txt", b"x") for index in range(2000))
+    entries += (_file("big.bin", b"abcd" * (64 * 1024)),)
+    payload = _payload(entries, single_file=False)
+
+    result = build_archive(
+        payload,
+        quine_name="manybig.store.7z",
+        seed_name=".quinepack/manybig.store.7z.seed",
+        compressed=False,
+    )
+
+    verify_built(result, payload)
+    assert int(result.layout["T"]) > CHUNK
 
 
 def test_seed_parent_directory_is_not_duplicated() -> None:

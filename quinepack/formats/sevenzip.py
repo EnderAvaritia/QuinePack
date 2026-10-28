@@ -210,7 +210,9 @@ class _StoreBuilder:
         self.files = files
         self.content = content
 
-    def layout(self, d_seed: int, maxdist_hint: int) -> dict[str, object]:
+    def layout(
+        self, d_seed: int, maxdist_hint: int, *, large: bool = False
+    ) -> dict[str, object]:
         d = d_seed + len(self.content)
         lengths: list[int] = []
         remaining = d + 35
@@ -393,6 +395,23 @@ class _StoreBuilder:
                     file_pos += len(block)
 
             assert file_pos == (output_pos - d) - 3
+            if large:
+                return self._finish_large(
+                    chunks=chunks,
+                    output_pos=output_pos,
+                    file_pos=file_pos,
+                    d=d,
+                    d_seed=d_seed,
+                    jump_len=jump_len,
+                    need_ds=need_ds,
+                    header_a=header_a,
+                    header_b=header_b,
+                    lengths=lengths,
+                    chunk_count=chunk_count,
+                    dict_prop=dict_prop,
+                    dict_size=dict_size,
+                    file_sizes=file_sizes,
+                )
             chunks.append(
                 {
                     "kind": "store",
@@ -482,9 +501,124 @@ class _StoreBuilder:
             gadget_size, header_size = new_gadget_size, new_header_size
         raise RuntimeError("store layout did not converge")
 
+    def _finish_large(
+        self,
+        *,
+        chunks: list[dict[str, object]],
+        output_pos: int,
+        file_pos: int,
+        d: int,
+        d_seed: int,
+        jump_len: int,
+        need_ds: int,
+        header_a: bytes,
+        header_b: bytes,
+        lengths: list[int],
+        chunk_count: int,
+        dict_prop: int,
+        dict_size: int,
+        file_sizes: list[int],
+    ) -> dict[str, object]:
+        """Emit the footer from a seed plant instead of a <=64 KiB store.
+
+        The classic footer keeps the gmatch block, terminator and 7z header in
+        one store chunk.  That caps the header at the LZMA2 store limit.  Here
+        the same byte image is planted at the end of the seed and emitted with
+        ordinary matches; the physical tail then only contains encoded match
+        chunks, so the header may exceed 64 KiB.
+        """
+        s = output_pos - d
+        assert file_pos == s - 3
+        header_size = 100
+        tail_len = 100
+        for _ in range(80):
+            distance = len(self.content) + s + tail_len
+            assert distance <= dict_size, (
+                f"tail distance {distance} exceeds dictionary {dict_size}"
+            )
+            tail_chunks: list[dict[str, object]] = []
+            offset = 0
+            encoded = 0
+            tail_file = file_pos
+            while offset < tail_len:
+                take = min(tail_len - offset, LZ2_MAX_UNPACKED)
+                block, unpacked = lzma_chunk(
+                    matches_for(distance, take), d + s + offset
+                )
+                assert unpacked == take
+                tail_chunks.append(
+                    {
+                        "kind": "lzma",
+                        "foff": tail_file,
+                        "size": len(block),
+                        "ooff": d + s + offset,
+                        "olen": take,
+                        "bytes": block,
+                        "tail": True,
+                    }
+                )
+                encoded += len(block)
+                tail_file += len(block)
+                offset += take
+            term = {
+                "kind": "term",
+                "foff": tail_file,
+                "size": 1,
+                "ooff": d + s + tail_len,
+                "olen": 0,
+                "bytes": b"\x00",
+            }
+            final_file = tail_file + 1
+            n = final_file - 32
+            assert n == s + encoded - 34
+            total = 32 + n + header_size
+            sub_sizes = (d_seed,) + tuple(file_sizes) + (total,)
+            header, crc_base = _build_header(
+                self.entries,
+                pack_size=n,
+                unpack_sizes=(d + total,),
+                sub_sizes=sub_sizes,
+                dict_props=(dict_prop,),
+            )
+            new_header_size = len(header)
+            new_tail_len = total - s
+            if new_tail_len == tail_len and new_header_size == header_size:
+                plant_off = d_seed - tail_len
+                need_ds = max(need_ds, 6 + jump_len + tail_len)
+                assert output_pos + tail_len == d + total
+                return {
+                    "large": True,
+                    "d": d,
+                    "ds": d_seed,
+                    "k": chunk_count,
+                    "lengths": lengths,
+                    "chunks": chunks + tail_chunks + [term],
+                    "header": header,
+                    "crc_base": crc_base,
+                    "n": n,
+                    "total": total,
+                    "T": tail_len,
+                    "h": new_header_size,
+                    "hdrA": header_a,
+                    "hdrB": header_b,
+                    "jump_y": jump_len,
+                    "need_ds": need_ds,
+                    "n_sub": len(sub_sizes),
+                    "sub_sizes": sub_sizes,
+                    "dict_size": dict_size,
+                    "s": s,
+                    "L": tail_len,
+                    "plant_off": plant_off,
+                }
+            header_size = new_header_size
+            tail_len = new_tail_len
+        raise RuntimeError("large store layout did not converge")
+
     def assemble(
         self, layout: dict[str, object]
     ) -> tuple[bytearray, bytes | bytearray]:
+        if layout.get("large"):
+            return self._assemble_large(layout)
         total = int(layout["total"])
         d = int(layout["d"])
         d_seed = int(layout["ds"])
@@ -546,6 +680,77 @@ class _StoreBuilder:
                 ]
         return out, seed
 
+    def _assemble_large(
+        self, layout: dict[str, object]
+    ) -> tuple[bytearray, bytes | bytearray]:
+        """Assemble a layout whose footer is carried by the seed plant."""
+        total = int(layout["total"])
+        d = int(layout["d"])
+        d_seed = int(layout["ds"])
+        header_size = int(layout["h"])
+        header_offset = total - header_size
+        chunks = list(layout["chunks"])
+        out = bytearray(total)
+
+        out[0:6] = SIG
+        out[6:8] = VER
+        struct.pack_into("<Q", out, 12, int(layout["n"]))
+        struct.pack_into("<Q", out, 20, header_size)
+
+        jump_chunk = None
+        c1_end = 0
+        for chunk in chunks:
+            if chunk["kind"] == "store":
+                out[chunk["foff"] : chunk["foff"] + 3] = store_hdr(
+                    chunk["olen"], first=chunk.get("first", False)
+                )
+                if chunk.get("c1"):
+                    c1_end = max(
+                        c1_end, int(chunk["foff"]) + 3 + int(chunk["olen"])
+                    )
+            else:
+                out[chunk["foff"] : chunk["foff"] + chunk["size"]] = chunk["bytes"]
+                if chunk.get("jump"):
+                    jump_chunk = chunk
+        out[header_offset : header_offset + header_size] = layout["header"]
+        assert jump_chunk is not None
+
+        s = int(layout["s"])
+        tail_len = int(layout["L"])
+        plant_off = int(layout["plant_off"])
+        assert s >= c1_end, f"tail plant overlaps seed region: {s} < {c1_end}"
+        jump_len = int(layout["jump_y"])
+        jump_plant = bytes(
+            out[jump_chunk["ooff"] - d : jump_chunk["ooff"] - d + jump_len]
+        )
+        seed = bytearray(d_seed)
+        seed[0:3] = layout["hdrA"]
+        seed[3:6] = layout["hdrB"]
+        seed[6 : 6 + jump_len] = jump_plant
+        gap = plant_off - (6 + jump_len)
+        assert gap >= 0, f"seed too small for tail plant: {d_seed}"
+        pad = (SEED_NOTE * (gap // len(SEED_NOTE) + 2))[:gap]
+        seed[6 + jump_len : plant_off] = pad
+        tail = out[s:total]
+        assert len(tail) == tail_len
+        seed[plant_off : plant_off + tail_len] = tail
+
+        for chunk in chunks:
+            if chunk["kind"] != "store":
+                continue
+            offset = chunk["ooff"]
+            length = chunk["olen"]
+            if chunk.get("c1"):
+                self._copy_store_source(
+                    out, chunk["foff"] + 3, chunk["S"], length, seed
+                )
+            else:
+                start = offset - d
+                out[chunk["foff"] + 3 : chunk["foff"] + 3 + length] = out[
+                    start : start + length
+                ]
+        return out, seed
+
     def _copy_store_source(
         self,
         out: bytearray,
@@ -577,6 +782,8 @@ class _StoreBuilder:
     def solve_crc(
         self, out: bytearray, layout: dict[str, object], seed: bytes | bytearray
     ) -> list[int]:
+        if layout.get("large"):
+            return self._solve_crc_large(out, layout, seed)
         gadget_size = int(layout["T"])
         header_size = int(layout["h"])
         d = int(layout["d"])
@@ -670,9 +877,167 @@ class _StoreBuilder:
         assert targets() == tuple(values), "CRC fix-up failed"
         return values
 
+    def _solve_crc_large(
+        self, out: bytearray, layout: dict[str, object], seed: bytes | bytearray
+    ) -> list[int]:
+        """Solve archive, header, signature and seed CRCs in one linear system.
+
+        The footer header exists twice physically (real tail and seed plant),
+        and the seed CRC depends on that plant, so the large-footer layout needs
+        a fourth equation over the classic 96-bit signature/header system.
+        """
+        header_size = int(layout["h"])
+        d = int(layout["d"])
+        d_seed = int(layout["ds"])
+        chunk_count = int(layout["k"])
+        n_sub = int(layout["n_sub"])
+        crc_base = int(layout["crc_base"])
+        total = int(layout["total"])
+        header_offset = total - header_size
+        header_seed = d_seed - header_size
+        data_slot = crc_base + 4 * (n_sub - 1)
+        next_copy = 32 + 3 * chunk_count + d
+        assert isinstance(seed, bytearray)
+        assert bytes(seed[header_seed:]) == layout["header"]
+
+        seed_map = [-1] * d_seed
+        for chunk in layout["chunks"]:
+            if not chunk.get("c1"):
+                continue
+            source = int(chunk["S"])
+            length = int(chunk["olen"])
+            target = int(chunk["foff"]) + 3
+            for index in range(length):
+                position = source + index
+                if position < d_seed:
+                    seed_map[position] = target + index
+        assert all(position >= 0 for position in seed_map), "seed is not fully mapped"
+
+        def header_slot(offset: int) -> tuple[list[list[int]], list[list[int]]]:
+            seed_slot = [header_seed + offset + index for index in range(4)]
+            real_slot = [header_offset + offset + index for index in range(4)]
+            mirror = [seed_map[position] for position in seed_slot]
+            return [real_slot, mirror], [seed_slot]
+
+        def signature_slot(offset: int) -> tuple[list[list[int]], list[list[int]]]:
+            return [
+                [offset + index for index in range(4)],
+                [next_copy + offset + index for index in range(4)],
+            ], []
+
+        def patch(
+            out_copies: list[list[int]],
+            seed_copies: list[list[int]],
+            value: int,
+        ) -> None:
+            raw = struct.pack("<I", value)
+            for copy in out_copies:
+                for index, position in enumerate(copy):
+                    out[position] = raw[index]
+            for copy in seed_copies:
+                for index, position in enumerate(copy):
+                    seed[position] = raw[index]
+
+        known = [_crc32(seed)] + [_crc32(data) for _, data in self.files]
+        assert len(known) == n_sub - 1
+        for index, value in enumerate(known):
+            # The seed CRC is itself one of the solver groups; leave its slot
+            # at the zero placeholder so the linear system starts from a clean
+            # value.  Payload/file CRCs are fixed and can be written now.
+            if index == 0:
+                continue
+            out_copies, seed_copies = header_slot(crc_base + 4 * index)
+            patch(out_copies, seed_copies, value)
+
+        groups = [
+            header_slot(data_slot),
+            signature_slot(28),
+            signature_slot(8),
+            header_slot(crc_base),
+        ]
+        view = memoryview(out)
+
+        def targets() -> tuple[int, int, int, int]:
+            return (
+                _crc32(view),
+                _crc32(view[header_offset : header_offset + header_size]),
+                _crc32(view[12:32]),
+                _crc32(seed),
+            )
+
+        def flip(
+            out_copies: list[list[int]],
+            seed_copies: list[list[int]],
+            bit_index: int,
+        ) -> None:
+            byte_index = bit_index // 8
+            bit = 1 << (bit_index % 8)
+            for copy in out_copies:
+                out[copy[byte_index]] ^= bit
+            for copy in seed_copies:
+                seed[copy[byte_index]] ^= bit
+
+        base = targets()
+        size = 32 * len(groups)
+        base_vector = 0
+        for index, value in enumerate(base):
+            base_vector |= value << (32 * index)
+
+        columns: list[int] = []
+        for out_copies, seed_copies in groups:
+            for bit_index in range(32):
+                flip(out_copies, seed_copies, bit_index)
+                values = targets()
+                flip(out_copies, seed_copies, bit_index)
+                vector = 0
+                for index, value in enumerate(values):
+                    vector |= (value ^ base[index]) << (32 * index)
+                columns.append(vector)
+
+        equations = []
+        for row in range(size):
+            coefficient = 0
+            for column in range(size):
+                if (columns[column] >> row) & 1:
+                    coefficient |= 1 << column
+            coefficient ^= 1 << row
+            equations.append([coefficient, (base_vector >> row) & 1])
+
+        for column in range(size):
+            pivot = next(
+                (
+                    row
+                    for row in range(column, size)
+                    if (equations[row][0] >> column) & 1
+                ),
+                None,
+            )
+            if pivot is None:
+                raise RuntimeError(f"CRC system is singular at bit {column}")
+            equations[column], equations[pivot] = equations[pivot], equations[column]
+            for row in range(size):
+                if row != column and ((equations[row][0] >> column) & 1):
+                    equations[row][0] ^= equations[column][0]
+                    equations[row][1] ^= equations[column][1]
+
+        solution = 0
+        for row in range(size):
+            assert equations[row][0] == (1 << row)
+            if equations[row][1]:
+                solution |= 1 << row
+
+        values = [
+            (solution >> (32 * index)) & 0xFFFFFFFF for index in range(len(groups))
+        ]
+        for (out_copies, seed_copies), value in zip(groups, values):
+            patch(out_copies, seed_copies, value)
+        assert targets() == tuple(values), "CRC fix-up failed"
+        return values
+
     def build(self) -> tuple[bytes | bytearray, dict[str, object], bytes | bytearray]:
         d_seed = 64
         last_error: Exception | None = None
+        large = False
         report("laying out")
         for _ in range(80):
             d = d_seed + len(self.content)
@@ -686,7 +1051,7 @@ class _StoreBuilder:
                 2 * d + (1 << 21),
             )
             try:
-                layout = self.layout(d_seed, max_distance)
+                layout = self.layout(d_seed, max_distance, large=large)
                 need_ds = int(layout["need_ds"])
                 if d_seed < need_ds:
                     d_seed = need_ds
@@ -697,7 +1062,10 @@ class _StoreBuilder:
                 self.solve_crc(out, layout, seed)
                 return out, layout, seed
             except _StoreHeaderTooLarge:
-                raise
+                if large:
+                    raise
+                large = True
+                continue
             except (RuntimeError, AssertionError) as error:
                 last_error = error
                 d_seed += 1
