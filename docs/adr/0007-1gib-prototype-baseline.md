@@ -72,6 +72,8 @@ Windows 10 x64、64 GiB RAM、Python 3.12.4，官方 7-Zip 23.01 验收。载荷
 | 1 GiB | 7z-store | 145 s | 2094 MiB | 1,077,171,500 B |
 | 1 GiB | txz | 688 s | 4141 MiB | 1,077,175,216 B |
 
+> 表中 `7z-store` / `txz` 的 64 MiB 以上产物在当时的布局下存在自含结构错误，不能作为正确性证据；这些数字仅用于内存/耗时基线。2026-10-28 的 gear / planted-copy 修复已通过 48 MiB `7z-store` 与 42 MiB `txz` 校验，见 README。
+
 关键改动：
 
 - 单文件载荷不再做第二次 `join`；tar.xz 去掉未使用的载荷副本。

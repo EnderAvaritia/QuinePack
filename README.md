@@ -29,11 +29,13 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
+> `7z-store` / `txz` 的 64 MiB 以上数字为修复前测量；当时产物无法通过官方校验。修复后已验证 48 MiB `7z-store` 与 42 MiB `txz` 的正确性，性能数据待重测。
+
 尚未实现：
 
 - 归档 `F` 仍整份驻留；压缩版 seed 在 `release_payload` 路径上已改为虚拟种子，不再分配整份 seed。
 - 压缩版 tar.xz（ADR-0002 限定为 store-only）。
-- 已知问题：`txz` 在约 40 MiB 以上、`7z-store` 在 64 MiB 级载荷上会被官方解压器报告 CRC/结构错误；大载荷请优先使用 `7z`，该问题在修复前不要用于生产。
+- 大文件自含布局已修复：`txz` 42 MiB、`7z-store` 48 MiB 均通过官方解压器校验，解压出的自含副本与产物 SHA-256 一致；更大规格的 `7z-store` / `txz` 性能复测尚未完成。
 - 超过 1 GiB 的载荷（ADR-0003）。
 - ZIP 变体（ADR-0006）。
 - `path` 之外的 PAX 记录（mtime 纳秒、超大文件大小、xattr 均不携带）。
@@ -197,7 +199,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
 - `7z-store` 在约 1500 个以上小文件时可能失败：其 gadget 会包含完整 7z header，超过单个 64 KiB store chunk 上限，报错形如 `store build failed`。此时改用 `--format 7z` 或 `--format txz`；`7z` 压缩版在 2000 个小文件下已验证正常。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限。
 - 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
-- `txz` 约 40 MiB 以上、`7z-store` 64 MiB 级载荷的官方解压校验会失败；大载荷请先用 `7z`。
+- 大文件布局回归已覆盖 42 MiB `txz` 与 48 MiB `7z-store`（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 规格尚未在当前实现上重跑，生产使用前请先做目标尺寸验收。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
 
 ## 许可证
