@@ -195,13 +195,23 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集与耗�
 
 | 载荷 | `7z` | `7z-store` | `txz` |
 |---|---:|---:|---:|
-| 64 MiB | 664 MiB / 44 s | 152 MiB / 21 s | 279 MiB / 50 s |
-| 256 MiB | 697 MiB / 224 s | 546 MiB / 105 s | 1051 MiB / 171 s |
-| 1 GiB | 2107 MiB / 923 s | 2120 MiB / 411 s | 4142 MiB / 693 s |
+| 64 MiB | 664 MiB / 44 s | 153 MiB / 6 s | 344 MiB / 7 s |
+| 256 MiB | 697 MiB / 224 s | 548 MiB / 23 s | 1310 MiB / 23 s |
+| 1 GiB | 2107 MiB / 923 s | 2118 MiB / 93 s | 5171 MiB / 88 s |
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
-> `7z-store` / `txz` 的数字为修复后、产物已通过官方校验的有效基线；`7z` 数字沿用此前有效基线。旧的 `7z-store` 144.8 s / `txz` 688.2 s 属于修复前产物不可校验的测量，不能作为当前实现的生产性能承诺。
+`7z-store` 与 `txz` 的耗时来自 ADR-0008 的子进程并行编码；`7z` 路径本次未改动，数字沿用此前基线（复测 64 MiB 44 s、256 MiB 220 s，差异在噪声范围内）。`txz` 的峰值工作集随之上升（64 MiB 279 → 344 MiB，256 MiB 1051 → 1310 MiB，1 GiB 4142 → 5171 MiB），来自并行 CRC64 的共享内存分片副本。
+
+> 旧的 `7z-store` 144.8 s / `txz` 688.2 s 属于修复前产物不可校验的测量，不能作为当前实现的性能承诺。ADR-0008 之前（4 核以上串行）的 `7z-store` 411 s / `txz` 693 s 只用于对比。
+
+### 并行范围
+
+- `7z-store` 的 match chunk 编码：载荷 ≥ 8 MiB 时按计划分片交给工作进程。
+- `txz` 的 CRC64：待哈希流 ≥ 32 MiB 时按共享内存分片并行，父进程用 GF(2) 多项式合并。
+- 两处都只做纯函数分片并按提交顺序回收，产物逐字节不变。
+
+`QUINEPACK_NO_MP=1` 会关闭全部工作进程，退回进程内实现（用于受限环境或调试）。
 
 ### 1 GiB 验收（当前提交）
 
@@ -213,6 +223,15 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集与耗�
 | `txz` | 1,077,176,176 B | `xz -t` 通过 | `71a03875b6b8f970f040bd98917276a52e5f5053a61366e34c67f7b724286beb` |
 
 两种自含副本均与产物逐字节一致。1 GiB 外部 `tar -xJf` 在 Windows 样本上出现 `tar`/`xz` 管道悬挂，因此 `txz` 的自含副本改用 Python `tarfile` 读取校验；归档本身已通过 `xz -t`。
+
+2026-10-29 的 ADR-0008 并行实现复测（载荷名 `random-1024.bin`）：
+
+| 格式 | 产物大小 | 官方校验 |
+|---|---:|---|
+| `7z-store` | 1,077,172,843 B | `7z t` → `Everything is Ok` |
+| `txz` | 1,077,176,176 B | `xz -t` 通过 |
+
+同一载荷下 64 MiB 三种产物的 SHA-256 与并行改造前完全一致，说明布局字节未变。
 
 ### 多文件条目验收
 
@@ -264,7 +283,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - `7z-store` 的 large-footer 路径会在 header 超过单个 64 KiB store chunk 时，把 footer 镜像放进 seed 并用 match 输出；代价是 seed 与归档约为 `2 × header + 载荷`，极大条目数仍受内存与 LZMA2 字典距离约束。
 - 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
 - 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；生产使用前请按目标尺寸做性能验收。
-- Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
+- Windows 上纯 Python CRC64 仍慢于 C 实现；ADR-0008 后它按共享内存分片并行，但 `QUINEPACK_NO_MP=1` 或小于 32 MiB 的流仍走单核。
 
 尚未实现：
 
@@ -283,6 +302,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - [ADR-0005](docs/adr/0005-deterministic-output.md)：产物逐字节可复现。
 - [ADR-0006](docs/adr/0006-no-zip.md)：ZIP 不纳入产物格式。
 - [ADR-0007](docs/adr/0007-1gib-prototype-baseline.md)：1 GiB 原型基线与内存门槛。
+- [ADR-0008](docs/adr/0008-parallel-encoders.md)：热点编码子进程并行，产物字节不变。
 - [CONTEXT.md](CONTEXT.md)：术语表。
 
 ## 许可证
