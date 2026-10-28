@@ -174,39 +174,50 @@ def _command_pack(args: argparse.Namespace) -> int:
     payload = scan_payload(
         args.input, tuple(args.exclude), warn=reporter.warning
     )
-    reporter.detail(f"payload: {len(payload.entries)} entries, {payload.total_bytes} bytes")
+    try:
+        reporter.detail(
+            f"payload: {len(payload.entries)} entries, {payload.total_bytes} bytes"
+        )
 
-    if formats is None:
-        formats = _select_formats_interactive(payload)
+        if formats is None:
+            formats = _select_formats_interactive(payload)
 
-    planned = _plan_outputs(payload, args.input, formats, args.output, args.outdir)
-    selected = _select_targets(planned, reporter, force=args.force)
+        planned = _plan_outputs(payload, args.input, formats, args.output, args.outdir)
+        selected = _select_targets(planned, reporter, force=args.force)
 
-    preset = DEFAULT_PRESET if args.preset is None else args.preset
-    if args.preset is not None and any(
-        not format_is_compressed(format_key) for format_key, _ in selected
-    ):
-        reporter.warning("--preset has no effect on 7z-store or txz")
+        preset = DEFAULT_PRESET if args.preset is None else args.preset
+        if args.preset is not None and any(
+            not format_is_compressed(format_key) for format_key, _ in selected
+        ):
+            reporter.warning("--preset has no effect on 7z-store or txz")
 
-    for format_key, output in selected:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        reporter.info(f"building {output.name}")
-        with stage_sink(reporter.stage):
-            data = _build(payload, format_key, output.name, preset)
-        reporter.stage("writing")
-        _write_atomic(output, data)
-        reporter.info(f"wrote {output} ({_human_size(len(data))})")
+        for format_key, output in selected:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            reporter.info(f"building {output.name}")
+            with stage_sink(reporter.stage):
+                data = _build(
+                    payload,
+                    format_key,
+                    output.name,
+                    preset,
+                    release_payload=len(selected) == 1,
+                )
+            reporter.stage("writing")
+            _write_atomic(output, data)
+            reporter.info(f"wrote {output} ({_human_size(len(data))})")
 
-        if args.verify:
-            reporter.stage("verifying")
-            verify_archive(
-                output,
-                against=args.input,
-                seven_zip=args.seven_zip,
-                excludes=tuple(args.exclude),
-            )
+            if args.verify:
+                reporter.stage("verifying")
+                verify_archive(
+                    output,
+                    against=args.input,
+                    seven_zip=args.seven_zip,
+                    excludes=tuple(args.exclude),
+                )
 
-    return 0
+        return 0
+    finally:
+        payload.close()
 
 
 def _command_verify(args: argparse.Namespace) -> int:
@@ -295,7 +306,9 @@ def _build(
     format_key: str,
     artifact: str,
     preset: int,
-) -> bytes | bytearray:
+    *,
+    release_payload: bool = False,
+) -> bytes | bytearray | memoryview:
     try:
         if format_key == "txz":
             from .formats.tarxz import build_archive
@@ -304,6 +317,7 @@ def _build(
                 payload,
                 quine_name=artifact,
                 seed_name=seed_name(artifact),
+                release_payload=release_payload,
             )
         else:
             from .formats.sevenzip import build_archive
@@ -314,6 +328,7 @@ def _build(
                 seed_name=seed_name(artifact),
                 compressed=format_is_compressed(format_key),
                 preset=preset,
+                release_payload=release_payload,
             )
     except ImportError as exc:
         raise QuinePackError(
@@ -325,12 +340,12 @@ def _build(
         raise QuinePackError(f"failed to build {artifact}: {exc}") from exc
 
     data = getattr(result, "data", None)
-    if not isinstance(data, (bytes, bytearray)):
+    if not isinstance(data, (bytes, bytearray, memoryview)):
         raise QuinePackError(f"the {format_key} writer returned no archive data")
     return data
 
 
-def _write_atomic(output: Path, data: bytes | bytearray) -> None:
+def _write_atomic(output: Path, data: bytes | bytearray | memoryview) -> None:
     partial = output.with_name(f"{output.name}.partial")
     try:
         with open(partial, "wb") as handle:

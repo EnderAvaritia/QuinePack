@@ -165,14 +165,15 @@ def test_single_file_change_while_reading_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = _write(tmp_path / "app.txt", b"payload")
-    original = Path.read_bytes
+    original = scan._stream_file_into
 
-    def changing_read(self: Path) -> bytes:
-        data = original(self)
-        os.utime(self, ns=(1_700_000_000_000_000_000,) * 2)
-        return data
+    def changing_stream(
+        path: Path, label: str, expected_size: int, store: scan.ContentStore
+    ) -> None:
+        original(path, label, expected_size, store)
+        os.utime(path, ns=(1_700_000_000_000_000_000,) * 2)
 
-    monkeypatch.setattr(Path, "read_bytes", changing_read)
+    monkeypatch.setattr(scan, "_stream_file_into", changing_stream)
 
     with pytest.raises(PayloadError, match="changed while reading"):
         scan_payload(source)

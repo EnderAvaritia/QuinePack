@@ -20,15 +20,16 @@ from __future__ import annotations
 import binascii
 import lzma
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle
 from ..lzma2 import (
     CHUNK,
     LZ2_MAX_UNPACKED,
     MAX_MATCH,
-    clear_dict_reset,
     dict_prop_for,
-    lzma2_raw,
+    lzma2_raw_buffer,
     lzma_chunk,
     matches_for,
     seed_chunks,
@@ -49,10 +50,10 @@ SEED_NOTE = b"\nQuinePack seed"
 class BuildResult:
     """In-memory 7z quine archive plus the metadata needed to verify it."""
 
-    data: bytes | bytearray
+    data: Buffer
     entries: tuple[tuple[str, bool], ...]
-    files: tuple[tuple[str, bytes], ...]
-    seed: bytes | bytearray
+    files: tuple[tuple[str, Buffer], ...]
+    seed: Buffer
     layout: dict[str, object]
     compressed: bool
 
@@ -61,7 +62,7 @@ class BuildResult:
 class _Entry:
     name: str
     is_dir: bool
-    data: bytes
+    data: Buffer
     mtime_ns: int
     attributes: int = 0
 
@@ -92,13 +93,6 @@ def _filetime(mtime_ns: int) -> int:
     return mtime_ns // 100 + FILETIME_EPOCH_OFFSET
 
 
-def _join_files(files: tuple[tuple[str, bytes], ...]) -> bytes:
-    """Concatenate payload bytes without copying a single-file payload twice."""
-    if len(files) == 1:
-        return files[0][1]
-    return b"".join(data for _, data in files)
-
-
 def _prepare_entries(
     payload: Payload, quine_name: str, seed_name: str
 ) -> tuple[_Entry, ...]:
@@ -117,7 +111,7 @@ def _prepare_entries(
             _Entry(
                 entry.path,
                 entry.is_dir,
-                entry.data or b"",
+                b"",
                 entry.mtime_ns,
                 entry.attributes,
             )
@@ -201,10 +195,15 @@ def _build_header(
 
 
 class _StoreBuilder:
-    def __init__(self, entries: tuple[_Entry, ...], files: tuple[tuple[str, bytes], ...]):
+    def __init__(
+        self,
+        entries: tuple[_Entry, ...],
+        files: tuple[tuple[str, Buffer], ...],
+        content: Buffer,
+    ):
         self.entries = entries
         self.files = files
-        self.content = _join_files(files)
+        self.content = content
 
     def layout(self, d_seed: int, maxdist_hint: int) -> dict[str, object]:
         d = d_seed + len(self.content)
@@ -640,14 +639,21 @@ class _DoubleBuilder:
     def __init__(
         self,
         entries: tuple[_Entry, ...],
-        files: tuple[tuple[str, bytes], ...],
+        files: tuple[tuple[str, Buffer], ...],
+        content: Buffer,
         preset: int,
+        release_payload: Callable[[], None] | None = None,
     ):
         self.entries = entries
         self.files = files
         self.preset = preset
-        self.content = _join_files(files)
-        self._compressed_content = b""
+        self.content = content
+        self.content_len = len(content)
+        self.file_sizes = tuple(len(data) for _, data in files)
+        self.file_crcs = tuple(_crc32(data) for _, data in files)
+        self._release_payload = release_payload
+        self._compressed_content: Buffer = b""
+        self._compressed_handle: SpoolHandle | None = None
         self._streams_cache: dict[str, object] | None = None
         self._mseg_cache: bytes | None = None
 
@@ -655,11 +661,28 @@ class _DoubleBuilder:
 
     def layout(self) -> dict[str, int]:
         content = self.content
+        content_len = self.content_len
         dict_c = min(
-            max(1 << 20, 1 << max(20, len(content).bit_length())), 64 << 20
+            max(1 << 20, 1 << max(20, content_len.bit_length())), 64 << 20
         )
-        compressed = clear_dict_reset(lzma2_raw(content, dict_c, self.preset))
+        compressed, handle = lzma2_raw_buffer(
+            content,
+            dict_c,
+            self.preset,
+            threshold=SPOOL_THRESHOLD,
+        )
         self._compressed_content = compressed
+        self._compressed_handle = handle
+        if self._release_payload is not None:
+            # The remaining layout only needs sizes and CRCs.  Drop the
+            # payload mapping before building token streams so it does not
+            # stay resident alongside C, seed and F.
+            release = self._release_payload
+            self._release_payload = None
+            self.files = tuple((name, b"") for name, _ in self.files)
+            self.content = b""
+            content = b""
+            release()
         lc = len(compressed)
 
         # Seed the fixed point near the usual ratio of match-segment
@@ -669,7 +692,7 @@ class _DoubleBuilder:
         mseg_len = max(256, lc // 2000)
         for _ in range(1000):
             ds = lc + 32 + header_len + plant_len
-            d = len(content) + ds
+            d = content_len + ds
             seed_lengths = seed_chunks(ds, lc, CHUNK)
             inner_prefix = 3 * len(seed_lengths) + ds
             m1 = mseg_len + 1
@@ -680,7 +703,7 @@ class _DoubleBuilder:
             streams = self._build_streams(lc, seed_lengths, inner_prefix, mseg_lengths)
             mseg = self._build_mseg(streams, d, lc, header_len)
             total = streams["n"] + 32 + header_len
-            sub_sizes = (ds,) + tuple(len(data) for _, data in self.files) + (total,)
+            sub_sizes = (ds,) + self.file_sizes + (total,)
             dict_in = dict_prop_for(d + total + 8192)[0]
             header, _ = _build_header(
                 self.entries,
@@ -714,11 +737,10 @@ class _DoubleBuilder:
         raise RuntimeError("double layout did not converge")
 
     def finalize(self, plant_len: int, header_len: int, mseg_len: int) -> dict[str, object]:
-        content = self.content
         compressed = self._compressed_content
         lc = len(compressed)
         ds = lc + 32 + header_len + plant_len
-        d = len(content) + ds
+        d = self.content_len + ds
         seed_lengths = seed_chunks(ds, lc, CHUNK)
         inner_prefix = 3 * len(seed_lengths) + ds
         m1 = mseg_len + 1
@@ -737,7 +759,7 @@ class _DoubleBuilder:
         assert len(mseg) == mseg_len, f"Mseg {len(mseg)} != {mseg_len}"
         total = streams["n"] + 32 + header_len
         dict_in, dict_in_size = dict_prop_for(d + total + 8192)
-        sub_sizes = (ds,) + tuple(len(data) for _, data in self.files) + (total,)
+        sub_sizes = (ds,) + self.file_sizes + (total,)
         header, crc_base = _build_header(
             self.entries,
             pack_size=streams["n"],
@@ -758,7 +780,7 @@ class _DoubleBuilder:
         return {
             "C": compressed,
             "lc": lc,
-            "dc": len(content),
+            "dc": self.content_len,
             "ds": ds,
             "d": d,
             "Li": inner_len,
@@ -1016,7 +1038,7 @@ class _DoubleBuilder:
                 ]
         out[header_offset : header_offset + header_len] = layout["header"]
 
-        compressed = layout["C"]
+        compressed = layout.pop("C")
         seed = bytearray(int(layout["ds"]))
         lc = int(layout["lc"])
         seed[0:lc] = compressed
@@ -1074,7 +1096,10 @@ class _DoubleBuilder:
         return positions
 
     def solve_crc(
-        self, out: bytearray, layout: dict[str, object], compressed: bytes
+        self,
+        out: bytearray,
+        layout: dict[str, object],
+        compressed_crc: int,
     ) -> list[int]:
         header_len = int(layout["H"])
         header_offset = int(layout["total"]) - header_len
@@ -1088,7 +1113,7 @@ class _DoubleBuilder:
         plant_parts = layout["plant_parts"]
 
         def seed_crc() -> int:
-            value = _crc32(compressed)
+            value = compressed_crc
             value = _crc32(view[0:32], value)
             value = _crc32(view[header_offset : header_offset + header_len], value)
             for part in plant_parts:
@@ -1105,7 +1130,7 @@ class _DoubleBuilder:
                 _crc32(view[12:32]),
             )
 
-        known = [_crc32(data) for _, data in self.files]
+        known = list(self.file_crcs)
         for index, value in enumerate(known):
             slot = crc_base + 4 * (1 + index)
             packed = struct.pack("<I", value)
@@ -1189,15 +1214,23 @@ class _DoubleBuilder:
         assert targets() == tuple(values), "CRC fix-up failed"
         return values
 
-    def build(self) -> tuple[bytes | bytearray, dict[str, object], bytes | bytearray]:
+    def close(self) -> None:
+        """Release the mapped compressed stream, if any."""
+        self._compressed_content = b""
+        if self._compressed_handle is not None:
+            self._compressed_handle.close()
+            self._compressed_handle = None
+
+    def build(self) -> tuple[Buffer, dict[str, object], Buffer]:
         report("compressing")
         first = self.layout()
         report("laying out")
         layout = self.finalize(first["Y"], first["H"], first["M"])
+        compressed_crc = _crc32(self._compressed_content)
         report("assembling")
         out, seed = self.assemble(layout)
         report("fixing CRCs")
-        self.solve_crc(out, layout, layout["C"])
+        self.solve_crc(out, layout, compressed_crc)
         header_offset = int(layout["total"]) - int(layout["H"])
         lc = int(layout["lc"])
         header_len = int(layout["H"])
@@ -1230,20 +1263,33 @@ def build_archive(
     seed_name: str,
     compressed: bool,
     preset: int = 6,
+    release_payload: bool = False,
 ) -> BuildResult:
-    """Build the 7z archive in memory without touching the filesystem."""
+    """Build the 7z archive, spooling large payloads to temp files."""
     entries = _prepare_entries(payload, quine_name, seed_name)
     files = tuple((entry.path, entry.data or b"") for entry in payload.files)
+    content = payload.content_view
+    release = payload.release_content if release_payload and compressed else None
     builder = (
-        _DoubleBuilder(entries, files, preset)
+        _DoubleBuilder(entries, files, content, preset, release)
         if compressed
-        else _StoreBuilder(entries, files)
+        else _StoreBuilder(entries, files, content)
     )
-    data, layout, seed = builder.build()
+    # The builder now owns these views.  Dropping the caller's references lets
+    # a release callback unmap the payload while build() is still running.
+    del content, files
+    try:
+        data, layout, seed = builder.build()
+        # Drop the compressed-stream view before closing its mapping.
+        layout.pop("C", None)
+    finally:
+        close = getattr(builder, "close", None)
+        if close is not None:
+            close()
     return BuildResult(
         data=data,
         entries=tuple((entry.name, entry.is_dir) for entry in entries),
-        files=files,
+        files=builder.files,
         seed=seed,
         layout=_public_layout(layout, compressed),
         compressed=compressed,

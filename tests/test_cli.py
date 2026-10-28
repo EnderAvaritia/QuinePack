@@ -44,6 +44,7 @@ class _FakeWriter:
         seed_name: str,
         compressed: bool,
         preset: int = 6,
+        release_payload: bool = False,
     ) -> SimpleNamespace:
         self.calls.append(_Call(payload, quine_name, seed_name, compressed, preset))
         if self.error is not None:
@@ -81,6 +82,7 @@ def fake_tarxz(monkeypatch: pytest.MonkeyPatch) -> list[_TarxzCall]:
         *,
         quine_name: str,
         seed_name: str,
+        release_payload: bool = False,
     ) -> SimpleNamespace:
         calls.append(_TarxzCall(payload, quine_name, seed_name))
         return SimpleNamespace(data=b"fake-txz")

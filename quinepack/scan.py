@@ -1,6 +1,8 @@
 """Payload scanning (product spec section 7).
 
-Stage 1 reads file contents into memory; the 1 GiB cap keeps that bounded.
+Small payloads stay in memory.  Once the scan exceeds ``SPOOL_THRESHOLD`` the
+bytes are written to a temporary file and exposed through ``mmap``, so the
+1 GiB cap no longer implies a 1 GiB Python-heap allocation.
 """
 
 from __future__ import annotations
@@ -9,13 +11,16 @@ import fnmatch
 import os
 import stat
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
+from .buffers import SPOOL_THRESHOLD, ContentStore
 from .errors import PayloadError
 from .model import Payload, PayloadEntry
 from .naming import SEED_DIR
 
 MAX_PAYLOAD_BYTES = 1 << 30
+READ_CHUNK = 1 << 20
 
 
 def scan_payload(
@@ -45,27 +50,34 @@ def _scan_file(source: Path, info: os.stat_result) -> Payload:
     if size > MAX_PAYLOAD_BYTES:
         raise PayloadError(_too_large_message(size))
 
-    data = _read_file(source, f"file: {source}", size)
+    store = ContentStore(threshold=SPOOL_THRESHOLD)
     try:
-        after = source.stat()
-    except OSError as exc:
-        raise PayloadError(f"cannot stat {source}: {exc}") from exc
-    if after.st_size != size or after.st_mtime_ns != info.st_mtime_ns:
-        raise PayloadError(f"file changed while reading: {source}")
-    entry = PayloadEntry(
-        path=source.name,
-        is_dir=False,
-        data=data,
-        mtime_ns=info.st_mtime_ns,
-        mode=stat.S_IMODE(info.st_mode),
-        attributes=getattr(info, "st_file_attributes", 0),
-    )
-    return Payload(
-        source=source,
-        entries=(entry,),
-        total_bytes=len(data),
-        is_single_file=True,
-    )
+        _stream_file_into(source, f"file: {source}", size, store)
+        try:
+            after = source.stat()
+        except OSError as exc:
+            raise PayloadError(f"cannot stat {source}: {exc}") from exc
+        if after.st_size != size or after.st_mtime_ns != info.st_mtime_ns:
+            raise PayloadError(f"file changed while reading: {source}")
+        view = store.view()
+        entry = PayloadEntry(
+            path=source.name,
+            is_dir=False,
+            data=view[0:size],
+            mtime_ns=info.st_mtime_ns,
+            mode=stat.S_IMODE(info.st_mode),
+            attributes=getattr(info, "st_file_attributes", 0),
+        )
+        return Payload(
+            source=source,
+            entries=(entry,),
+            total_bytes=size,
+            is_single_file=True,
+            _store=store,
+        )
+    except BaseException:
+        store.close()
+        raise
 
 
 class _CaseFoldIndex:
@@ -87,6 +99,17 @@ class _CaseFoldIndex:
             )
 
 
+@dataclass(slots=True)
+class _PendingEntry:
+    path: str
+    is_dir: bool
+    start: int
+    size: int
+    mtime_ns: int
+    mode: int
+    attributes: int
+
+
 class _DirectoryScanner:
     """Depth-first walk that keeps directories before files on every level."""
 
@@ -99,22 +122,45 @@ class _DirectoryScanner:
         self.root = root
         self.patterns = _normalize_excludes(excludes)
         self.paths = _CaseFoldIndex(warn)
-        self.entries: list[PayloadEntry] = []
+        self.store = ContentStore(threshold=SPOOL_THRESHOLD)
+        self.pending: list[_PendingEntry] = []
         self.total_bytes = 0
 
     def run(self) -> Payload:
-        reserved = self.root / SEED_DIR
-        if reserved.exists() or reserved.is_symlink():
-            raise PayloadError(
-                f"payload root contains the reserved directory {SEED_DIR!r}: {reserved}"
+        try:
+            reserved = self.root / SEED_DIR
+            if reserved.exists() or reserved.is_symlink():
+                raise PayloadError(
+                    f"payload root contains the reserved directory {SEED_DIR!r}: "
+                    f"{reserved}"
+                )
+            self._walk(self.root, (), frozenset({os.path.realpath(self.root)}))
+            view = self.store.view()
+            entries = tuple(
+                PayloadEntry(
+                    path=item.path,
+                    is_dir=item.is_dir,
+                    data=(
+                        None
+                        if item.is_dir
+                        else view[item.start : item.start + item.size]
+                    ),
+                    mtime_ns=item.mtime_ns,
+                    mode=item.mode,
+                    attributes=item.attributes,
+                )
+                for item in self.pending
             )
-        self._walk(self.root, (), frozenset({os.path.realpath(self.root)}))
-        return Payload(
-            source=self.root,
-            entries=tuple(self.entries),
-            total_bytes=self.total_bytes,
-            is_single_file=False,
-        )
+            return Payload(
+                source=self.root,
+                entries=entries,
+                total_bytes=self.total_bytes,
+                is_single_file=False,
+                _store=self.store,
+            )
+        except BaseException:
+            self.store.close()
+            raise
 
     def _walk(
         self,
@@ -147,18 +193,19 @@ class _DirectoryScanner:
                 raise PayloadError(f"unsupported file type: {rel}")
 
         for _, info, rel in directories:
-            self.entries.append(
-                PayloadEntry(
+            self.pending.append(
+                _PendingEntry(
                     path=rel,
                     is_dir=True,
-                    data=None,
+                    start=0,
+                    size=0,
                     mtime_ns=info.st_mtime_ns,
                     mode=stat.S_IMODE(info.st_mode),
                     attributes=getattr(info, "st_file_attributes", 0),
                 )
             )
         for child, info, rel in files:
-            self.entries.append(self._read_entry(child, info, rel))
+            self.pending.append(self._read_entry(child, info, rel))
 
         for child, _, rel in directories:
             real = os.path.realpath(child)
@@ -166,13 +213,14 @@ class _DirectoryScanner:
                 raise PayloadError(f"symbolic link cycle detected at {rel}")
             self._walk(child, (*rel_parts, child.name), ancestors | {real})
 
-    def _read_entry(self, child: Path, info: os.stat_result, rel: str) -> PayloadEntry:
+    def _read_entry(self, child: Path, info: os.stat_result, rel: str) -> _PendingEntry:
         size = info.st_size
         self.total_bytes += size
         if self.total_bytes > MAX_PAYLOAD_BYTES:
             raise PayloadError(_too_large_message(self.total_bytes))
 
-        data = _read_file(child, rel, size)
+        start = self.store.size
+        _stream_file_into(child, rel, size, self.store)
         try:
             after = child.stat()
         except OSError as exc:
@@ -180,10 +228,11 @@ class _DirectoryScanner:
         if after.st_size != size or after.st_mtime_ns != info.st_mtime_ns:
             raise PayloadError(f"file changed while reading: {rel}")
 
-        return PayloadEntry(
+        return _PendingEntry(
             path=rel,
             is_dir=False,
-            data=data,
+            start=start,
+            size=size,
             mtime_ns=info.st_mtime_ns,
             mode=stat.S_IMODE(info.st_mode),
             attributes=getattr(info, "st_file_attributes", 0),
@@ -198,14 +247,25 @@ class _DirectoryScanner:
         )
 
 
-def _read_file(path: Path, label: str, expected_size: int) -> bytes:
+def _stream_file_into(
+    path: Path, label: str, expected_size: int, store: ContentStore
+) -> None:
+    """Copy a file into the content store without materialising it in RAM."""
+    read = 0
     try:
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(READ_CHUNK)
+                if not chunk:
+                    break
+                read += len(chunk)
+                if read > expected_size:
+                    raise PayloadError(f"file changed while reading: {label}")
+                store.append(chunk)
     except OSError as exc:
         raise PayloadError(f"cannot read {label}: {exc}") from exc
-    if len(data) != expected_size:
+    if read != expected_size:
         raise PayloadError(f"file changed while reading: {label}")
-    return data
 
 
 def _normalize_excludes(patterns: Sequence[str]) -> tuple[str, ...]:

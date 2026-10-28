@@ -27,7 +27,9 @@ import io
 import lzma
 import struct
 import tarfile
+from collections.abc import Callable
 
+from ..buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle, SpoolWriter
 from ..errors import PayloadError
 from ..lzma2 import (
     CHUNK,
@@ -120,7 +122,7 @@ def _make_crc64_slice_tables() -> list[list[int]]:
 _CRC64_SLICE = _make_crc64_slice_tables()
 
 
-def _crc64_pure_update(state: int, data: bytes | bytearray) -> int:
+def _crc64_pure_update(state: int, data: Buffer) -> int:
     """Update a raw CRC64 state, eight bytes at a time."""
     length = len(data)
     offset = 0
@@ -145,15 +147,23 @@ def _crc64_pure_update(state: int, data: bytes | bytearray) -> int:
     return state
 
 
-def _crc64_update(value: int, data: bytes | bytearray) -> int:
+def _crc64_update(value: int, data: Buffer) -> int:
     """Extend a finished CRC64 value with more bytes."""
     if _liblzma is not None:
         if isinstance(data, bytes):
             pointer = ctypes.c_char_p(data)
-        else:
-            pointer = ctypes.cast(
-                (ctypes.c_char * len(data)).from_buffer(data), ctypes.c_void_p
-            )
+            return int(_liblzma.lzma_crc64(pointer, len(data), value))
+        if isinstance(data, bytearray) or (
+            isinstance(data, memoryview) and not data.readonly
+        ):
+            raw = (ctypes.c_char * len(data)).from_buffer(data)
+            try:
+                return int(_liblzma.lzma_crc64(raw, len(data), value))
+            finally:
+                del raw
+        # Read-only buffers are rare on this path; copy rather than hand
+        # liblzma a pointer the ctypes layer cannot pin.
+        pointer = ctypes.c_char_p(bytes(data))
         return int(_liblzma.lzma_crc64(pointer, len(data), value))
     state = _crc64_pure_update(value ^ _CRC64_XOROUT, data)
     return state ^ _CRC64_XOROUT
@@ -417,7 +427,7 @@ def _add_gear(
     return output_pos + unpacked, file_pos + len(block)
 
 
-def _forward_vac(archive: bytearray, vac: dict[str, object], q: int) -> None:
+def _forward_vac(archive: Buffer, vac: dict[str, object], q: int) -> None:
     start = int(vac["ooff"]) - q
     length = int(vac["olen"])
     archive[start : start + length] = archive[start + length : start + 2 * length]
@@ -434,14 +444,17 @@ class _TarXzBuilder:
         payload: Payload,
         quine_name: str,
         seed_name: str,
+        release_payload: Callable[[], None] | None = None,
     ) -> None:
         self.quine_name = quine_name
         self.seed_name = seed_name
         self.entries: tuple[PayloadEntry, ...] = payload.entries
-        self.files: tuple[tuple[str, bytes], ...] = tuple(
+        self._release_payload = release_payload
+        self.files: tuple[tuple[str, Buffer], ...] = tuple(
             (entry.path, entry.data or b"") for entry in payload.files
         )
         self.file_map = dict(self.files)
+        self._handles: list[SpoolHandle] = []
         self.generated_mtime = (
             self.entries[0].mtime_ns // 1_000_000_000 if self.entries else 0
         )
@@ -1074,7 +1087,7 @@ class _TarXzBuilder:
         target: int,
         source: int,
         length: int,
-        tar_prefix: bytes,
+        tar_prefix: Buffer,
     ) -> None:
         """Copy from ``tar_prefix + archive[0:few]`` without joining them."""
         prefix_length = len(tar_prefix)
@@ -1114,7 +1127,7 @@ class _TarXzBuilder:
         self,
         archive: bytearray,
         layout: dict[str, object],
-        tar_prefix: bytes,
+        tar_prefix: Buffer,
     ) -> None:
         q = int(layout["q"])
         block_header_size = int(layout["bh"])
@@ -1172,6 +1185,20 @@ class _TarXzBuilder:
         ), "CRC64 fixpoint verification failed"
 
     # -- public build ------------------------------------------------------
+
+    def release_payload(self) -> None:
+        if self._release_payload is None:
+            return
+        release = self._release_payload
+        self._release_payload = None
+        self.files = tuple((name, b"") for name, _ in self.files)
+        self.file_map = {}
+        release()
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.close()
+        self._handles.clear()
 
     def build(self) -> tuple[bytes, dict[str, object], bytes]:
         report("laying out")
@@ -1237,11 +1264,22 @@ def build_archive(
     *,
     quine_name: str,
     seed_name: str,
+    release_payload: bool = False,
 ) -> BuildResult:
-    """Build the store-only tar.xz quine in memory."""
+    """Build the store-only tar.xz quine, spooling large tar prefixes."""
     _validate_tar_names(payload, quine_name, seed_name)
-    builder = _TarXzBuilder(payload, quine_name, seed_name)
-    data, layout, seed = builder.build()
+    builder = _TarXzBuilder(
+        payload,
+        quine_name,
+        seed_name,
+        payload.release_content if release_payload else None,
+    )
+    try:
+        data, layout, seed = builder.build()
+        if release_payload:
+            builder.release_payload()
+    finally:
+        builder.close()
     return BuildResult(
         data=data,
         entries=builder.public_entries(layout["entries"]),

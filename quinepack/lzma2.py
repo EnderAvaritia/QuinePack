@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import lzma
 
+from .buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle, SpoolWriter
+
 # ---------------------------------------------------------------------------
 # LZMA range coder constants
 # ---------------------------------------------------------------------------
@@ -323,7 +325,7 @@ def lzma_chunk(tokens: list[Token], out_pos: int) -> tuple[bytes, int]:
     return header + data, total
 
 
-def lzma2_raw(data: bytes, dict_size: int, preset: int = 6) -> bytearray:
+def lzma2_raw(data: Buffer, dict_size: int, preset: int = 6) -> bytearray:
     """Raw LZMA2 compression without the trailing 0x00 end marker.
 
     Input is fed in blocks so the compressor never materialises a second full
@@ -346,7 +348,43 @@ def lzma2_raw(data: bytes, dict_size: int, preset: int = 6) -> bytearray:
     return out
 
 
-def clear_dict_reset(data: bytearray) -> bytearray:
+def lzma2_raw_buffer(
+    data: Buffer,
+    dict_size: int,
+    preset: int = 6,
+    *,
+    threshold: int = SPOOL_THRESHOLD,
+) -> tuple[Buffer, SpoolHandle | None]:
+    """Compress to memory, or to a mapped temp file for large payloads."""
+    if len(data) < threshold:
+        return clear_dict_reset(lzma2_raw(data, dict_size, preset)), None
+
+    writer = SpoolWriter(threshold=0)
+    try:
+        compressor = lzma.LZMACompressor(
+            format=lzma.FORMAT_RAW,
+            filters=[
+                {"id": lzma.FILTER_LZMA2, "dict_size": dict_size, "preset": preset}
+            ],
+        )
+        view = memoryview(data)
+        block = 1 << 20
+        for offset in range(0, len(view), block):
+            writer.write(compressor.compress(view[offset : offset + block]))
+        writer.write(compressor.flush())
+        output, handle = writer.finish(writable=True)
+    except BaseException:
+        writer.close()
+        raise
+    assert output and output[-1] == 0x00, "LZMA2 stream must end with 0x00"
+    # Dropping the end marker keeps the same bytes as ``lzma2_raw`` while
+    # avoiding a copy of the compressed stream.
+    output = output[:-1]
+    clear_dict_reset(output)
+    return output, handle
+
+
+def clear_dict_reset(data: Buffer) -> Buffer:
     """Drop the leading dictionary reset so this stream can follow other chunks."""
     if not data:
         return data
