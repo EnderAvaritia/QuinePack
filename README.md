@@ -80,6 +80,14 @@ quinepack pack site/ \
   --verify
 ```
 
+自定义产物文件名（只能配合单一格式）：
+
+```bash
+quinepack pack site/ \
+  --format txz \
+  -o dist/custom-name.tar.xz
+```
+
 校验已有归档：
 
 ```bash
@@ -90,8 +98,8 @@ quinepack verify dist/site.tar.xz --against site/
 常用参数：
 
 - `--format`：`7z`、`7z-store`、`txz`，或逗号分隔组合；`all` 表示三种全部生成。
-- `-o, --output`：指定单个输出文件，只能配合单一格式。
-- `--outdir`：指定输出目录。
+- `-o, --output`：指定单个输出文件的完整路径，只能配合单一格式，不能与 `--outdir` 同用；父目录会自动创建。
+- `--outdir`：指定输出目录，文件名仍按输入名推导。
 - `--preset`：7z 压缩等级 0–9，默认 6。
 - `--exclude`：按相对路径 glob 排除内容，可重复使用。
 - 非交互环境（非 TTY）必须显式传 `--format`。
@@ -128,6 +136,8 @@ site/
 ```
 
 `7z-store` 与 `txz` 的目录结构相同，只是自含副本和种子文件名分别对应 `site.store.7z`、`site.tar.xz`。
+
+产物名同时决定自含副本与种子名：自含副本与产物同名，种子为 `.quinepack/<产物名>.seed`。使用 `-o` 自定义文件名时建议保留对应后缀（`.7z`、`.store.7z`、`.tar.xz`），否则 `verify` 与外部工具可能无法仅凭名称识别格式。一次生成多种格式时不能分别指定文件名；需要多次运行 `pack`，每次用 `-o`。
 
 `tar.xz` 在成员名无法放入 ustar 字段或包含非 ASCII 字符时，会在该成员前写入 PAX 扩展头。长载荷路径、Unicode 文件名与长产物名因此可以经 GNU `tar`、BusyBox `tar` 与 Python `tarfile` 往返。
 
