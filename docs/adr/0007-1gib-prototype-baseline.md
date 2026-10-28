@@ -124,3 +124,11 @@ Windows 10 x64、64 GiB RAM、Python 3.12.4，官方 7-Zip 23.01 验收。载荷
 | `txz` | 1,077,176,176 B | `xz -t` 通过 | `71a03875b6b8f970f040bd98917276a52e5f5053a61366e34c67f7b724286beb` |
 
 两种自含副本均与产物逐字节一致。1 GiB `txz` 的 Windows 外部 `tar -xJf` 出现管道悬挂，自含副本改用 Python `tarfile` 校验；这不影响 `xz -t` 的归档有效性结论。修复后 1 GiB `7z-store` / `txz` 的耗时与峰值尚未重测。
+
+## 7z-store large-footer（2026-10-28）
+
+原 footer 将 gmatch、终止符和完整 7z header 放进单个 store chunk，因此 header 超过 64 KiB 时无法自含。修复后当 footer 超过 `CHUNK` 时，改用 seed-planted tail：把 `archive[s:total]` 镜像放进 seed，用普通 match chunks 输出，物理尾部仅保留编码后的 match 流。
+
+- 2000 与 5000 个 1 字节小文件均通过 `verify_built`、官方 `7z t` 与 `7z x` 后的自含副本 SHA-256 比对。
+- 产物大小分别约 159.6 KB / 397.7 KB；seed 与归档约按 `2 × header + 载荷` 增长。
+- 仍保持单 LZMA2 coder；未引入 `kEncodedHeader`，兼容性风险不变。

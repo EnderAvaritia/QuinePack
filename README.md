@@ -42,6 +42,15 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 两种自含副本均与产物逐字节一致。1 GiB 外部 `tar -xJf` 在 Windows 样本上出现 `tar`/`xz` 管道悬挂，因此 `txz` 的自含副本改用 Python `tarfile` 读取校验；归档本身已通过 `xz -t`。
 
+### 多文件条目验收
+
+`7z-store` 的 large-footer 路径（header 超过 64 KiB）已用 1 字节小文件验收：
+
+| 条目数 | 产物大小 | 官方校验 | 自含副本 |
+|---:|---:|---|---|
+| 2,000 | 159,599 B | `7z t` 通过 | `7z x` 后 SHA-256 与产物一致 |
+| 5,000 | 397,747 B | `7z t` 通过 | `7z x` 后 SHA-256 与产物一致 |
+
 尚未完成：
 
 - 归档 `F` 仍整份驻留；压缩版 seed 在 `release_payload` 路径上已改为虚拟种子，不再分配整份 seed。
@@ -139,7 +148,7 @@ quinepack version
 格式选择建议：
 
 - 需要体积收益：用 `7z`。
-- 文件条目数很多（实测 1660 个小文件可建，1680 个失败，具体取决于名称与元数据）：用 `7z` 或 `txz`，避免 `7z-store`。
+- 文件条目数很多但仍需要单 coder 的 7z 兼容性：用 `7z-store`；large-footer 路径已验证 2000 / 5000 个小文件。需要体积收益时用 `7z`。
 - 不想依赖 7-Zip：用 `txz`。
 
 ## 输出布局
@@ -198,7 +207,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - 空文件、空目录、Unicode 文件名、ustar prefix 与 PAX 长名称。
 - 自含副本 SHA-256、CRC64 fixpoint、确定性重复构建。
 - 路径穿越、符号链接、硬链接、设备/FIFO 等不安全 tar 成员。
-- `7z-store` footer 边界：1660 个小文件可建，2000 个给出明确错误。
+- `7z-store` large-footer：2000 / 5000 个小文件构建、官方 `7z t`、解压自含副本 SHA-256 均通过。
 - `--format all`、`-o` 自定义文件名、非 TTY 保护与 `.partial` 原子写入。
 
 测试套件会从 `PATH` 或标准 7-Zip 安装目录查找 `7z` / `7zr` 运行官方验收用例；找不到时跳过并给出提示。仅当 `xz` 与 `tar` 都缺失时，才跳过对应验收用例。
@@ -209,7 +218,7 @@ python tools/bench_memory.py --size 256 --format 7z
 
 - 仍不是完整流式实现：归档 `F` 仍整份驻留；压缩版 seed 在单格式 `release_payload` 路径上已改为虚拟种子。临时文件位于当前工作目录，构建失败时也会尽力清理。
 - 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
-- `7z-store` 的尾部 gadget 必须装进单个 64 KiB LZMA2 store chunk；header 随文件条目数增长，因此条目很多时会失败。固定测试数据（`f00000.txt`、1 字节文件）实测 1660 个可建，1680 个失败；报错为 `7z-store cannot encode ... above the 65536-byte LZMA2 store chunk limit`，并提示改用 `--format 7z` 或 `--format txz`。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限；`7z` 压缩版在 2000 个小文件下已验证正常。要真正突破该上限，需要实现 7z `kEncodedHeader`（压缩 header）或放弃单 coder 的 `7z-store` 兼容性，当前未实现。
+- `7z-store` 的 large-footer 路径会在 header 超过单个 64 KiB store chunk 时，把 footer 镜像放进 seed 并用 match 输出；2000 / 5000 个小文件已通过官方 `7z t` 与解压自含副本 SHA-256 校验。代价是 seed 与归档约为 `2 × header + 载荷`，极大条目数仍受内存与 LZMA2 字典距离约束。
 - 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
 - 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 的性能/峰值仍未在当前实现上重测，生产使用前请按目标尺寸做性能验收。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
