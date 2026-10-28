@@ -163,6 +163,13 @@ def _crc64_pure_update(state: int, data: Buffer) -> int:
     return state
 
 
+def _crc64_raw_update(state: int, data: Buffer) -> int:
+    """Extend a raw (un-finalised) CRC64 state with more bytes."""
+    if _liblzma is not None:
+        return _crc64_update(state ^ _CRC64_XOROUT, data) ^ _CRC64_XOROUT
+    return _crc64_pure_update(state, data)
+
+
 def _crc64_combine(left: int, right: int, right_length: int) -> int:
     """Append ``right_length`` bytes of zeros-worth of transform to a state."""
     if right_length <= 0:
@@ -202,7 +209,13 @@ def _crc64_parts(parts: Sequence[Buffer], pool=None) -> int:
     """
     parts = tuple(parts)
     total = sum(len(part) for part in parts)
-    if pool is None or not pool.parallel or total < _CRC64_MP_MIN_BYTES:
+    # A liblzma CRC64 runs at several GB/s; splitting it only adds copies.
+    if (
+        pool is None
+        or not pool.parallel
+        or total < _CRC64_MP_MIN_BYTES
+        or _liblzma is not None
+    ):
         return _crc64_parts_sequential(parts)
     try:
         return _crc64_parts_parallel(parts, pool)
@@ -226,7 +239,7 @@ def _crc64_worker(task: tuple[int, list[tuple[str, int, int]]]) -> int:
         try:
             view = memoryview(block.buf)[offset : offset + length]
             try:
-                state = _crc64_pure_update(state, view)
+                state = _crc64_raw_update(state, view)
             finally:
                 view.release()
         finally:
