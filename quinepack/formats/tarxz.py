@@ -395,36 +395,100 @@ def _xz_stream_footer(backward_size: int) -> bytes:
 
 
 def _add_gear(
-    chunks: list[dict[str, object]], output_pos: int, file_pos: int, q: int
+    chunks: list[dict[str, object]],
+    output_pos: int,
+    file_pos: int,
+    q: int,
+    header_a_offset: int,
 ) -> tuple[int, int]:
-    """Append a store chunk plus a matching LZMA chunk.
+    """Append the store chunks and LZMA echoes that consume the current slip.
 
-    The pair reduces the file/output slip to ``len(compressed_block)``.
+    A single store/LZMA pair is valid only while ``slip + 3 <= CHUNK``: the
+    store must copy the whole source region ``[A, A + slip + 3)`` into a
+    payload at ``F = A + slip + 3`` so the following LZMA chunk can reproduce
+    that payload with one match at distance ``slip + 3``.  Larger regions are
+    tiled into ``CHUNK``-sized stores and every payload piece is echoed
+    separately; the three-byte LZMA2 headers between payload pieces are
+    reproduced from the seed's ``hdrA`` copy at ``header_a_offset``.
     """
-    length = min(file_pos - (output_pos - q) + 3, CHUNK)
-    chunks.append(
-        {
-            "kind": "store",
-            "foff": file_pos,
-            "size": 3 + length,
-            "ooff": output_pos,
-            "olen": length,
-        }
-    )
-    output_pos += length
-    file_pos += 3 + length
-    block, unpacked = lzma_chunk(matches_for(length, length), output_pos)
-    chunks.append(
-        {
-            "kind": "lzma",
-            "foff": file_pos,
-            "size": len(block),
-            "ooff": output_pos,
-            "olen": unpacked,
-            "bytes": block,
-        }
-    )
-    return output_pos + unpacked, file_pos + len(block)
+    slip = file_pos - (output_pos - q)
+    length = slip + 3
+    pieces = max(1, (length + CHUNK - 1) // CHUNK)
+    first = length - (pieces - 1) * CHUNK
+    if first < 2:
+        # A one-byte piece cannot be encoded as an LZMA match.  A bare
+        # one-byte store raises the slip by three and shifts the phase by one,
+        # which makes the first piece three bytes longer.
+        chunks.append(
+            {
+                "kind": "store",
+                "foff": file_pos,
+                "size": 4,
+                "ooff": output_pos,
+                "olen": 1,
+            }
+        )
+        output_pos += 1
+        file_pos += 4
+        slip = file_pos - (output_pos - q)
+        length = slip + 3
+        pieces = max(1, (length + CHUNK - 1) // CHUNK)
+        first = length - (pieces - 1) * CHUNK
+
+    lengths = [first] + [CHUNK] * (pieces - 1)
+    source = output_pos - q
+    payload_start = file_pos + 3
+    assert payload_start == source + length
+
+    for piece in lengths:
+        chunks.append(
+            {
+                "kind": "store",
+                "foff": file_pos,
+                "size": 3 + piece,
+                "ooff": output_pos,
+                "olen": piece,
+            }
+        )
+        output_pos += piece
+        file_pos += 3 + piece
+
+    covered = 0
+    for index, piece in enumerate(lengths):
+        if index > 0:
+            block, unpacked = lzma_chunk(
+                [("m", output_pos - header_a_offset, 3)], output_pos
+            )
+            assert unpacked == 3
+            chunks.append(
+                {
+                    "kind": "lzma",
+                    "foff": file_pos,
+                    "size": len(block),
+                    "ooff": output_pos,
+                    "olen": unpacked,
+                    "bytes": block,
+                }
+            )
+            output_pos += unpacked
+            file_pos += len(block)
+        distance = output_pos - (q + source + covered)
+        block, unpacked = lzma_chunk(matches_for(distance, piece), output_pos)
+        assert unpacked == piece
+        chunks.append(
+            {
+                "kind": "lzma",
+                "foff": file_pos,
+                "size": len(block),
+                "ooff": output_pos,
+                "olen": unpacked,
+                "bytes": block,
+            }
+        )
+        output_pos += unpacked
+        file_pos += len(block)
+        covered += piece
+    return output_pos, file_pos
 
 
 def _forward_vac(archive: Buffer, vac: dict[str, object], q: int) -> None:
@@ -603,6 +667,7 @@ class _TarXzBuilder:
         jump_length, jump_block)`` sorted by resulting archive size.
         """
         slip = file_gear - (output_gear - q)
+        header_a_offset = plant_offset - 6
         candidates: list[tuple[list[dict[str, object]], int, int, int, bytes]] = []
         seen: set[tuple[int, int]] = set()
 
@@ -622,7 +687,9 @@ class _TarXzBuilder:
                 output_pos += bare
                 file_pos += 3 + bare
 
-            output_pos, file_pos = _add_gear(chunks, output_pos, file_pos, q)
+            output_pos, file_pos = _add_gear(
+                chunks, output_pos, file_pos, q, header_a_offset
+            )
 
             remaining = file_pos - (output_pos - q)
             jump_length = max(2, remaining + 17)
@@ -924,7 +991,7 @@ class _TarXzBuilder:
 
         while file_pos - (output_pos - q) > 16:
             output_pos, file_pos = _add_gear(
-                base, output_pos, file_pos, q
+                base, output_pos, file_pos, q, header_a_offset
             )
 
         output_gear, file_gear = output_pos, file_pos
@@ -1200,6 +1267,25 @@ class _TarXzBuilder:
             handle.close()
         self._handles.clear()
 
+    def _fit_dictionary(self, layout: dict[str, object]) -> dict[str, object]:
+        """Raise the dictionary property until it covers every match distance.
+
+        Every match distance is bounded by the final output position, which is
+        the tar length.  The xz block header keeps its 12-byte size when the
+        dictionary property changes, so layout offsets and the CRC64 fixpoint
+        are unaffected; only the header bytes and the reported size change.
+        """
+        q = int(layout["q"])
+        output_final = q + _round_up_512(int(layout["xz_size"])) + 1024
+        if output_final <= int(layout["dict_size"]):
+            return layout
+        block_header, dict_size = _xz_block_header(output_final)
+        assert len(block_header) == int(layout["bh"]), len(block_header)
+        fitted = dict(layout)
+        fitted["block_hdr"] = block_header
+        fitted["dict_size"] = dict_size
+        return fitted
+
     def build(self) -> tuple[bytes, dict[str, object], bytes]:
         report("laying out")
         last_error: Exception | None = None
@@ -1225,7 +1311,7 @@ class _TarXzBuilder:
         )
         for d_seed in seed_sizes:
             try:
-                layout = self._layout_iterate(d_seed)
+                layout = self._fit_dictionary(self._layout_iterate(d_seed))
                 data, seed = self.assemble(layout)
                 return data, layout, seed
             except (RuntimeError, AssertionError, ValueError) as error:

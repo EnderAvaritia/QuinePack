@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import io
 import lzma
+import os
+import random
 import shutil
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from quinepack.errors import PayloadError, VerificationError
 from quinepack.formats.tarxz import (
     BuildResult,
+    _TarXzBuilder,
+    _add_gear,
     _crc64_update,
+    _round_up_512,
     build_archive,
     verify_built,
 )
+from quinepack.lzma2 import CHUNK, LZ2_MAX_UNPACKED
 from quinepack.model import Payload, PayloadEntry
 from quinepack.verify import verify_archive
 
@@ -372,6 +379,191 @@ def test_many_tiny_entries_select_a_large_enough_dictionary() -> None:
     verify_built(result, payload)
     # The old len(content)-based dictionary bound corrupted this case.
     assert lzma.decompress(result.data, format=lzma.FORMAT_XZ)
+
+
+class _SizedPayload:
+    """Length-only payload stand-in for layout tests.
+
+    ``_layout_iterate`` only reads entry sizes, so this avoids materialising a
+    42 MiB buffer while still running the real layout code.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __bool__(self) -> bool:
+        return True
+
+
+def _layout_payload(size: int) -> Payload:
+    entry = _file("payload.bin", cast(bytes, _SizedPayload(size)))
+    return _payload((entry,), single_file=True)
+
+
+def _layout_at(size: int) -> dict[str, object]:
+    builder = _TarXzBuilder(
+        _layout_payload(size),
+        "payload.bin.tar.xz",
+        ".quinepack/payload.bin.tar.xz.seed",
+    )
+    try:
+        return builder._layout_iterate(64)
+    finally:
+        builder.close()
+
+
+def test_gear_splits_slip_above_one_store_chunk() -> None:
+    layout = _layout_at(42 << 20)
+    q = int(layout["q"])
+    chunks = layout["chunks"]
+
+    start = next(
+        index
+        for index, chunk in enumerate(chunks)
+        if chunk["kind"] == "store" and not chunk.get("c1")
+    )
+    gear = chunks[start]
+    slip = int(gear["foff"]) - (int(gear["ooff"]) - q)
+    length = slip + 3
+    # The old capped pair produced length == CHUNK here and shifted the echo.
+    assert length > CHUNK
+    assert int(gear["foff"]) + 3 == (int(gear["ooff"]) - q) + length
+
+    pieces: list[int] = []
+    output_pos = int(gear["ooff"])
+    file_pos = int(gear["foff"])
+    for chunk in chunks[start:]:
+        if chunk["kind"] != "store":
+            break
+        assert int(chunk["ooff"]) == output_pos
+        assert int(chunk["foff"]) == file_pos
+        pieces.append(int(chunk["olen"]))
+        output_pos += int(chunk["olen"])
+        file_pos += 3 + int(chunk["olen"])
+
+    assert len(pieces) == -(-length // CHUNK)
+    assert pieces[0] == length - (len(pieces) - 1) * CHUNK
+    assert sum(pieces) == length
+    assert all(0 < piece <= CHUNK for piece in pieces)
+
+    echo = chunks[start + len(pieces)]
+    assert echo["kind"] == "lzma"
+    assert int(echo["ooff"]) == int(gear["foff"]) + 3 + q
+    assert int(echo["olen"]) == pieces[0]
+    if len(pieces) > 1:
+        shim = chunks[start + len(pieces) + 1]
+        assert shim["kind"] == "lzma"
+        assert int(shim["olen"]) == 3
+        assert int(shim["foff"]) == int(echo["foff"]) + int(echo["size"])
+
+
+def test_gear_bumps_a_one_byte_piece() -> None:
+    q = 1_000_000
+    output_pos = q + 1_000
+    slip = CHUNK - 2  # slip + 3 == CHUNK + 1: the first piece would be one byte
+    file_pos = 1_000 + slip
+    chunks: list[dict[str, object]] = []
+
+    _add_gear(chunks, output_pos, file_pos, q, header_a_offset=100)
+
+    bump = chunks[0]
+    assert bump["kind"] == "store"
+    assert bump["olen"] == 1
+    assert bump["size"] == 4
+    tiled = [chunk["olen"] for chunk in chunks[1:] if chunk["kind"] == "store"]
+    assert tiled == [4, CHUNK]
+    echoes = [chunk["olen"] for chunk in chunks if chunk["kind"] == "lzma"]
+    assert echoes == [4, 3, CHUNK]
+
+
+def test_layout_chunk_limits_and_store_alignment() -> None:
+    for size in (1 << 20, 42 << 20):
+        layout = _layout_at(size)
+        q = int(layout["q"])
+        assert (
+            q
+            + _round_up_512(int(layout["xz_size"]))
+            + 1024
+            <= int(layout["dict_size"])
+        )
+        for chunk in layout["chunks"]:
+            if chunk["kind"] == "store":
+                assert 0 < int(chunk["olen"]) <= CHUNK
+            elif chunk["kind"] == "lzma":
+                assert 2 <= int(chunk["olen"]) <= LZ2_MAX_UNPACKED
+            if (
+                chunk["kind"] == "store"
+                and not chunk.get("c1")
+                and not chunk.get("vac")
+                and not chunk.get("trailing")
+            ):
+                assert (
+                    int(chunk["ooff"]) - q + int(chunk["olen"])
+                    <= int(chunk["foff"]) + 3
+                )
+
+
+def test_fit_dictionary_raises_property_for_large_output() -> None:
+    builder = _TarXzBuilder(
+        _layout_payload(1),
+        "payload.bin.tar.xz",
+        ".quinepack/payload.bin.tar.xz.seed",
+    )
+    try:
+        # A 1 GiB - 1 MiB layout: the old 2q hint picked a 2 GiB dictionary
+        # while the jump distance was 2,148,816,485 bytes.
+        q = 1_072_695_296
+        xz_size = 1_076_124_084
+        layout: dict[str, object] = {
+            "q": q,
+            "xz_size": xz_size,
+            "dict_size": 1 << 31,
+            "bh": 12,
+            "block_hdr": b"\x00" * 12,
+        }
+        needed = q + _round_up_512(xz_size) + 1024
+        assert needed > 1 << 31
+
+        fitted = builder._fit_dictionary(layout)
+        assert int(fitted["dict_size"]) >= needed
+        assert len(fitted["block_hdr"]) == 12
+        assert fitted["block_hdr"] != layout["block_hdr"]
+
+        small: dict[str, object] = {
+            "q": 1_000,
+            "xz_size": 2_000,
+            "dict_size": 1 << 20,
+            "bh": 12,
+            "block_hdr": b"\x00" * 12,
+        }
+        assert builder._fit_dictionary(small) is small
+    finally:
+        builder.close()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("QUINEPACK_SLOW_TESTS"),
+    reason="set QUINEPACK_SLOW_TESTS=1 to run the 42 MiB regression",
+)
+def test_42_mib_layout_roundtrip() -> None:
+    data = random.Random(20261028).randbytes(42 << 20)
+    payload = _payload((_file("payload.bin", data),), single_file=True)
+
+    result = build_archive(
+        payload,
+        quine_name="payload.bin.tar.xz",
+        seed_name=".quinepack/payload.bin.tar.xz.seed",
+    )
+    verify_built(result, payload)
+
+    q = int(result.layout["q"])
+    assert q == 44_042_240
+    assert int(result.layout["k"]) == 673
+    tar_data = lzma.decompress(result.data, format=lzma.FORMAT_XZ)
+    assert tar_data[q : q + len(result.data)] == result.data
 
 
 def test_truncated_txz_is_a_verification_error(tmp_path: Path) -> None:
