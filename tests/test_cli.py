@@ -809,6 +809,63 @@ def test_verify_archive_compares_payload(
     verify_module.verify_archive(archive, against=source, workdir=tmp_path)
 
 
+def test_verify_archive_closes_scanned_payload_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "site.7z"
+    archive.write_bytes(b"archive-bytes")
+    source = tmp_path / "site"
+    source.mkdir()
+    (source / "hello.txt").write_bytes(b"hello")
+    _patch_extraction(monkeypatch, extra={"hello.txt": b"hello"})
+    scanned = SimpleNamespace(
+        files=(SimpleNamespace(path="hello.txt", data=b"hello"),),
+        dirs=(),
+        closed=False,
+    )
+
+    def close() -> None:
+        scanned.closed = True
+
+    scanned.close = close
+    monkeypatch.setattr(
+        verify_module, "scan_payload", lambda source, excludes=(): scanned
+    )
+
+    verify_module.verify_archive(archive, against=source, workdir=tmp_path)
+
+    assert scanned.closed is True
+
+
+def test_verify_archive_closes_scanned_payload_on_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "site.7z"
+    archive.write_bytes(b"archive-bytes")
+    source = tmp_path / "site"
+    source.mkdir()
+    (source / "hello.txt").write_bytes(b"hello")
+    _patch_extraction(monkeypatch, extra={"hello.txt": b"tampered"})
+    scanned = SimpleNamespace(
+        files=(SimpleNamespace(path="hello.txt", data=b"hello"),),
+        dirs=(),
+        closed=False,
+    )
+
+    def close() -> None:
+        scanned.closed = True
+
+    scanned.close = close
+    monkeypatch.setattr(
+        verify_module, "scan_payload", lambda source, excludes=(): scanned
+    )
+
+    with pytest.raises(VerificationError, match="does not match"):
+        verify_module.verify_archive(archive, against=source, workdir=tmp_path)
+
+    assert scanned.closed is True
+
+
 def test_verify_archive_detects_payload_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

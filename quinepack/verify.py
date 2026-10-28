@@ -171,32 +171,39 @@ def _verify_payload(
     excludes: Sequence[str],
 ) -> None:
     payload = scan_payload(source, excludes)
-    expected = {entry.path: entry for entry in payload.files}
-    expected_dirs = {entry.path for entry in payload.dirs}
-    actual = _extracted_files(extracted, archive_name)
-    actual_dirs = _extracted_dirs(extracted)
+    try:
+        expected = {entry.path: entry for entry in payload.files}
+        expected_dirs = {entry.path for entry in payload.dirs}
+        actual = _extracted_files(extracted, archive_name)
+        actual_dirs = _extracted_dirs(extracted)
 
-    missing = sorted(set(expected) - set(actual))
-    if missing:
-        raise VerificationError(f"payload entries missing from archive: {_preview(missing)}")
-    unexpected = sorted(set(actual) - set(expected))
-    if unexpected:
-        raise VerificationError(f"unexpected entries in archive: {_preview(unexpected)}")
+        missing = sorted(set(expected) - set(actual))
+        if missing:
+            raise VerificationError(
+                f"payload entries missing from archive: {_preview(missing)}"
+            )
+        unexpected = sorted(set(actual) - set(expected))
+        if unexpected:
+            raise VerificationError(
+                f"unexpected entries in archive: {_preview(unexpected)}"
+            )
 
-    missing_dirs = sorted(expected_dirs - actual_dirs)
-    if missing_dirs:
-        raise VerificationError(
-            f"payload directories missing from archive: {_preview(missing_dirs)}"
-        )
-    unexpected_dirs = sorted(actual_dirs - expected_dirs)
-    if unexpected_dirs:
-        raise VerificationError(
-            f"unexpected directories in archive: {_preview(unexpected_dirs)}"
-        )
+        missing_dirs = sorted(expected_dirs - actual_dirs)
+        if missing_dirs:
+            raise VerificationError(
+                f"payload directories missing from archive: {_preview(missing_dirs)}"
+            )
+        unexpected_dirs = sorted(actual_dirs - expected_dirs)
+        if unexpected_dirs:
+            raise VerificationError(
+                f"unexpected directories in archive: {_preview(unexpected_dirs)}"
+            )
 
-    for path, entry in expected.items():
-        if _sha256_bytes(entry.data or b"") != _sha256_file(actual[path]):
-            raise VerificationError(f"payload entry does not match: {path}")
+        for path, entry in expected.items():
+            if _sha256_bytes(entry.data or b"") != _sha256_file(actual[path]):
+                raise VerificationError(f"payload entry does not match: {path}")
+    finally:
+        payload.close()
 
 
 def _extracted_dirs(root: Path) -> set[str]:
