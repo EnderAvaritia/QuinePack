@@ -12,3 +12,4 @@ dist/
 tools/*.exe
 *.tmp
 *.partial
+.quinepack-spool-*/
