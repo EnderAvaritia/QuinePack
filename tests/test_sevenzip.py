@@ -300,6 +300,7 @@ def test_store_accepts_large_footer(count: int) -> None:
 
     if SEVEN_ZIP is not None:
         scratch = REPO_ROOT / "_tmp"
+        scratch.mkdir(exist_ok=True)
         archive = Path(tempfile.mkdtemp(prefix="sevenzip-many-", dir=scratch))
         try:
             path = archive / "many.store.7z"
