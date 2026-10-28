@@ -98,7 +98,7 @@ Windows 10 x64、64 GiB RAM、Python 3.12.4，官方 7-Zip 23.01 验收。载荷
 - 压缩版 7z 的 LZMA2 输出写临时文件后只读映射；
 - tar.xz 的 tar 前缀写临时文件后映射；
 - 单格式构建在压缩/前缀完成后释放载荷映射，避免与 seed、`F` 同时驻留；
-- 临时目录在成功与失败路径上清理，并有回归测试。
+- 临时目录在成功与失败路径上清理，并有回归测试；`--verify --against` 扫描的 Payload 也会在成功/失败路径关闭，避免 spool 残留。
 
 实测：
 
@@ -123,7 +123,20 @@ Windows 10 x64、64 GiB RAM、Python 3.12.4，官方 7-Zip 23.01 验收。载荷
 | `7z-store` | 1,077,172,763 B | `7z t` 通过 | `75e7c9cf8a5edfc94bc6dcaf4f74cfaa0d395aad289ada2d5580cd8c8fdaca60` |
 | `txz` | 1,077,176,176 B | `xz -t` 通过 | `71a03875b6b8f970f040bd98917276a52e5f5053a61366e34c67f7b724286beb` |
 
-两种自含副本均与产物逐字节一致。1 GiB `txz` 的 Windows 外部 `tar -xJf` 出现管道悬挂，自含副本改用 Python `tarfile` 校验；这不影响 `xz -t` 的归档有效性结论。修复后 1 GiB `7z-store` / `txz` 的耗时与峰值尚未重测。
+两种自含副本均与产物逐字节一致。1 GiB `txz` 的 Windows 外部 `tar -xJf` 出现管道悬挂，自含副本改用 Python `tarfile` 校验；这不影响 `xz -t` 的归档有效性结论。
+
+修复后有效性能基线（`tools/bench_memory.py`，不带 `--verify`）：
+
+| 载荷 | 格式 | 耗时 | 峰值工作集 | 产物 |
+|---|---:|---:|---:|---:|
+| 64 MiB | 7z-store | 21 s | 152 MiB | 67,320,036 B |
+| 64 MiB | txz | 50 s | 279 MiB | 67,323,784 B |
+| 256 MiB | 7z-store | 105 s | 546 MiB | 269,285,714 B |
+| 256 MiB | txz | 171 s | 1051 MiB | 269,289,364 B |
+| 1 GiB | 7z-store | 411 s | 2120 MiB | 1,077,172,843 B |
+| 1 GiB | txz | 693 s | 4142 MiB | 1,077,176,176 B |
+
+旧表中的 1 GiB `7z-store` 144.8 s / `txz` 688.2 s 属于修复前布局，产物当时无法通过官方校验，不能作为当前实现的性能承诺。产物大小会随归档名长度变化。
 
 ## 7z-store large-footer（2026-10-28）
 

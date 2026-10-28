@@ -23,13 +23,13 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 | 载荷 | `7z` | `7z-store` | `txz` |
 |---|---:|---:|---:|
-| 64 MiB | 664 MiB / 44 s | 149 MiB / 9 s | 277 MiB / 43 s |
-| 256 MiB | 697 MiB / 224 s | 538 MiB / 35 s | 1050 MiB / 167 s |
-| 1 GiB | 2107 MiB / 923 s | 2094 MiB / 145 s | 4141 MiB / 688 s |
+| 64 MiB | 664 MiB / 44 s | 152 MiB / 21 s | 279 MiB / 50 s |
+| 256 MiB | 697 MiB / 224 s | 546 MiB / 105 s | 1051 MiB / 171 s |
+| 1 GiB | 2107 MiB / 923 s | 2120 MiB / 411 s | 4142 MiB / 693 s |
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
-> `7z-store` / `txz` 的 64 MiB 以上数字为修复前测量；当时产物无法通过官方校验。修复后已验证 48 MiB `7z-store`、42 MiB `txz` 以及 1 GiB 两格式的正确性；表中 64 MiB 以上 `7z-store` / `txz` 的耗时与峰值仍为修复前基线，尚未重测。
+> `7z-store` / `txz` 的数字为修复后、产物已通过官方校验的有效基线；`7z` 数字沿用此前有效基线。旧的 `7z-store` 144.8 s / `txz` 688.2 s 属于修复前产物不可校验的测量，不能作为当前实现的生产性能承诺。
 
 ### 1 GiB 验收（当前提交）
 
@@ -55,7 +55,6 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 - 归档 `F` 仍整份驻留；压缩版 seed 在 `release_payload` 路径上已改为虚拟种子，不再分配整份 seed。
 - 压缩版 tar.xz（ADR-0002 限定为 store-only）。
-- 1 GiB `7z-store` / `txz` 的耗时与峰值复测（正确性已通过本页验收）。
 - 超过 1 GiB 的载荷（ADR-0003）。
 - ZIP 变体（ADR-0006）。
 - `path` 之外的 PAX 记录（mtime 纳秒、超大文件大小、xattr 均不携带）。
@@ -220,7 +219,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
 - `7z-store` 的 large-footer 路径会在 header 超过单个 64 KiB store chunk 时，把 footer 镜像放进 seed 并用 match 输出；2000 / 5000 个小文件已通过官方 `7z t` 与解压自含副本 SHA-256 校验。代价是 seed 与归档约为 `2 × header + 载荷`，极大条目数仍受内存与 LZMA2 字典距离约束。
 - 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
-- 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 的性能/峰值仍未在当前实现上重测，生产使用前请按目标尺寸做性能验收。
+- 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 的有效基线为 `7z-store` 约 411 s / 2.1 GB、`txz` 约 693 s / 4.1 GB，生产使用前请按目标尺寸做性能验收。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
 
 ## 许可证
