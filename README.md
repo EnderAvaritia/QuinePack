@@ -29,13 +29,24 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
-> `7z-store` / `txz` 的 64 MiB 以上数字为修复前测量；当时产物无法通过官方校验。修复后已验证 48 MiB `7z-store` 与 42 MiB `txz` 的正确性，性能数据待重测。
+> `7z-store` / `txz` 的 64 MiB 以上数字为修复前测量；当时产物无法通过官方校验。修复后已验证 48 MiB `7z-store`、42 MiB `txz` 以及 1 GiB 两格式的正确性；表中 64 MiB 以上 `7z-store` / `txz` 的耗时与峰值仍为修复前基线，尚未重测。
 
-尚未实现：
+### 1 GiB 验收（当前提交）
+
+2026-10-28 在当前 `7z-store` / `txz` 布局上重建并验收 1 GiB 载荷：
+
+| 格式 | 产物大小 | 官方校验 | 自含副本 SHA-256 |
+|---|---:|---|---|
+| `7z-store` | 1,077,172,763 B | `7z t` → `Everything is Ok` | `75e7c9cf8a5edfc94bc6dcaf4f74cfaa0d395aad289ada2d5580cd8c8fdaca60` |
+| `txz` | 1,077,176,176 B | `xz -t` 通过 | `71a03875b6b8f970f040bd98917276a52e5f5053a61366e34c67f7b724286beb` |
+
+两种自含副本均与产物逐字节一致。1 GiB 外部 `tar -xJf` 在 Windows 样本上出现 `tar`/`xz` 管道悬挂，因此 `txz` 的自含副本改用 Python `tarfile` 读取校验；归档本身已通过 `xz -t`。
+
+尚未完成：
 
 - 归档 `F` 仍整份驻留；压缩版 seed 在 `release_payload` 路径上已改为虚拟种子，不再分配整份 seed。
 - 压缩版 tar.xz（ADR-0002 限定为 store-only）。
-- 大文件自含布局已修复：`txz` 42 MiB、`7z-store` 48 MiB 均通过官方解压器校验，解压出的自含副本与产物 SHA-256 一致；更大规格的 `7z-store` / `txz` 性能复测尚未完成。
+- 1 GiB `7z-store` / `txz` 的耗时与峰值复测（正确性已通过本页验收）。
 - 超过 1 GiB 的载荷（ADR-0003）。
 - ZIP 变体（ADR-0006）。
 - `path` 之外的 PAX 记录（mtime 纳秒、超大文件大小、xattr 均不携带）。
@@ -128,7 +139,7 @@ quinepack version
 格式选择建议：
 
 - 需要体积收益：用 `7z`。
-- 文件条目数很多（约 1500 个以上小文件）：用 `7z` 或 `txz`，避免 `7z-store`。
+- 文件条目数很多（实测 1660 个小文件可建，1680 个失败，具体取决于名称与元数据）：用 `7z` 或 `txz`，避免 `7z-store`。
 - 不想依赖 7-Zip：用 `txz`。
 
 ## 输出布局
@@ -187,6 +198,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - 空文件、空目录、Unicode 文件名、ustar prefix 与 PAX 长名称。
 - 自含副本 SHA-256、CRC64 fixpoint、确定性重复构建。
 - 路径穿越、符号链接、硬链接、设备/FIFO 等不安全 tar 成员。
+- `7z-store` footer 边界：1660 个小文件可建，2000 个给出明确错误。
 - `--format all`、`-o` 自定义文件名、非 TTY 保护与 `.partial` 原子写入。
 
 测试套件会从 `PATH` 或标准 7-Zip 安装目录查找 `7z` / `7zr` 运行官方验收用例；找不到时跳过并给出提示。仅当 `xz` 与 `tar` 都缺失时，才跳过对应验收用例。
@@ -197,9 +209,9 @@ python tools/bench_memory.py --size 256 --format 7z
 
 - 仍不是完整流式实现：归档 `F` 仍整份驻留；压缩版 seed 在单格式 `release_payload` 路径上已改为虚拟种子。临时文件位于当前工作目录，构建失败时也会尽力清理。
 - 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
-- `7z-store` 在约 1500 个以上小文件时可能失败：其 gadget 会包含完整 7z header，超过单个 64 KiB store chunk 上限，报错形如 `store build failed`。此时改用 `--format 7z` 或 `--format txz`；`7z` 压缩版在 2000 个小文件下已验证正常。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限。
+- `7z-store` 的尾部 gadget 必须装进单个 64 KiB LZMA2 store chunk；header 随文件条目数增长，因此条目很多时会失败。固定测试数据（`f00000.txt`、1 字节文件）实测 1660 个可建，1680 个失败；报错为 `7z-store cannot encode ... above the 65536-byte LZMA2 store chunk limit`，并提示改用 `--format 7z` 或 `--format txz`。该限制由文件条目数 / header 大小触发，不是载荷总字节数上限；`7z` 压缩版在 2000 个小文件下已验证正常。要真正突破该上限，需要实现 7z `kEncodedHeader`（压缩 header）或放弃单 coder 的 `7z-store` 兼容性，当前未实现。
 - 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
-- 大文件布局回归已覆盖 42 MiB `txz` 与 48 MiB `7z-store`（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 规格尚未在当前实现上重跑，生产使用前请先做目标尺寸验收。
+- 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；1 GiB 的性能/峰值仍未在当前实现上重测，生产使用前请按目标尺寸做性能验收。
 - Windows 上纯 Python CRC64 仍会带来明显的二次遍历开销。
 
 ## 许可证
