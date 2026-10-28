@@ -122,3 +122,40 @@ def test_spooled_build_cleans_temporary_files(
         payload.close()
 
     assert list(tmp_path.glob(".quinepack-spool-*")) == []
+
+
+def test_compact_7z_matches_seeded_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(scan, "SPOOL_THRESHOLD", 0)
+    monkeypatch.setattr(sevenzip, "SPOOL_THRESHOLD", 0)
+    source = _write(tmp_path / "data.bin", bytes(range(256)) * 512)
+
+    payload = scan_payload(source)
+    try:
+        normal = sevenzip.build_archive(
+            payload,
+            quine_name="data.bin.7z",
+            seed_name=".quinepack/data.bin.7z.seed",
+            compressed=True,
+        )
+    finally:
+        payload.close()
+
+    payload = scan_payload(source)
+    try:
+        compact = sevenzip.build_archive(
+            payload,
+            quine_name="data.bin.7z",
+            seed_name=".quinepack/data.bin.7z.seed",
+            compressed=True,
+            release_payload=True,
+        )
+    finally:
+        payload.close()
+
+    assert compact.data == normal.data
+    assert compact.seed == b""
+    assert list(tmp_path.glob(".quinepack-spool-*")) == []
+

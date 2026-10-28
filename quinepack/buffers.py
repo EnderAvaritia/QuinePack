@@ -256,7 +256,23 @@ class ContentStore:
         self._view = memoryview(self._mapping)
         return self._view
 
-    def close(self) -> None:
+    def iter_chunks(self, chunk_size: int = 1 << 20):
+        """Yield content sequentially without creating a mapping."""
+        if self._file is None:
+            view = memoryview(self._memory)
+            for offset in range(0, len(view), chunk_size):
+                yield view[offset : offset + chunk_size]
+            return
+        self._file.flush()
+        self._file.seek(0)
+        while True:
+            chunk = self._file.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+    def release_view(self) -> None:
+        """Drop the mapping but keep the backing file readable."""
         if self._view is not None:
             try:
                 self._view.release()
@@ -269,6 +285,9 @@ class ContentStore:
             except BufferError:
                 pass
             self._mapping = None
+
+    def close(self) -> None:
+        self.release_view()
         if self._file is not None:
             try:
                 self._file.close()

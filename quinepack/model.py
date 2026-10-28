@@ -58,6 +58,27 @@ class Payload:
             return files[0].data or b""
         return b"".join(entry.data or b"" for entry in files)
 
+    def iter_content(self, chunk_size: int = 1 << 20):
+        """Yield payload bytes sequentially, using the store file when present."""
+        if self._store is not None:
+            yield from self._store.iter_chunks(chunk_size)
+            return
+        view = self.content_view
+        for offset in range(0, len(view), chunk_size):
+            yield view[offset : offset + chunk_size]
+
+    def release_views_keep_store(self) -> None:
+        """Drop mapped views but keep the spooled content readable."""
+        for entry in self.entries:
+            data = entry.data
+            if isinstance(data, memoryview):
+                try:
+                    data.release()
+                except (BufferError, ValueError):
+                    pass
+        if self._store is not None:
+            self._store.release_view()
+
     def release_content(self) -> None:
         """Release mapped payload views and their temporary files.
 

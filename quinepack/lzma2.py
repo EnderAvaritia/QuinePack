@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import lzma
 
+from collections.abc import Iterable
+
 from .buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle, SpoolWriter
 
 # ---------------------------------------------------------------------------
@@ -379,6 +381,34 @@ def lzma2_raw_buffer(
     assert output and output[-1] == 0x00, "LZMA2 stream must end with 0x00"
     # Dropping the end marker keeps the same bytes as ``lzma2_raw`` while
     # avoiding a copy of the compressed stream.
+    output = output[:-1]
+    clear_dict_reset(output)
+    return output, handle
+
+
+def lzma2_raw_reader(
+    chunks: Iterable[Buffer],
+    dict_size: int,
+    preset: int = 6,
+) -> tuple[Buffer, SpoolHandle | None]:
+    """Compress a sequential stream to a mapped temp file."""
+    writer = SpoolWriter(threshold=0)
+    try:
+        compressor = lzma.LZMACompressor(
+            format=lzma.FORMAT_RAW,
+            filters=[
+                {"id": lzma.FILTER_LZMA2, "dict_size": dict_size, "preset": preset}
+            ],
+        )
+        for chunk in chunks:
+            if chunk:
+                writer.write(compressor.compress(chunk))
+        writer.write(compressor.flush())
+        output, handle = writer.finish(writable=True)
+    except BaseException:
+        writer.close()
+        raise
+    assert output and output[-1] == 0x00, "LZMA2 stream must end with 0x00"
     output = output[:-1]
     clear_dict_reset(output)
     return output, handle

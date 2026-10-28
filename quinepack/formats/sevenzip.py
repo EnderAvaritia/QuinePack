@@ -20,7 +20,7 @@ from __future__ import annotations
 import binascii
 import lzma
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from ..buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle
@@ -30,6 +30,7 @@ from ..lzma2 import (
     MAX_MATCH,
     dict_prop_for,
     lzma2_raw_buffer,
+    lzma2_raw_reader,
     lzma_chunk,
     matches_for,
     seed_chunks,
@@ -643,14 +644,30 @@ class _DoubleBuilder:
         content: Buffer,
         preset: int,
         release_payload: Callable[[], None] | None = None,
+        *,
+        content_len: int | None = None,
+        content_reader: Callable[[], Iterable[Buffer]] | None = None,
+        compact_seed: bool = False,
+        file_sizes: tuple[int, ...] | None = None,
+        file_crcs: tuple[int, ...] | None = None,
     ):
         self.entries = entries
         self.files = files
         self.preset = preset
         self.content = content
-        self.content_len = len(content)
-        self.file_sizes = tuple(len(data) for _, data in files)
-        self.file_crcs = tuple(_crc32(data) for _, data in files)
+        self.content_len = len(content) if content_len is None else content_len
+        self.file_sizes = (
+            tuple(len(data) for _, data in files)
+            if file_sizes is None
+            else file_sizes
+        )
+        self.file_crcs = (
+            tuple(_crc32(data) for _, data in files)
+            if file_crcs is None
+            else file_crcs
+        )
+        self._content_reader = content_reader
+        self._compact_seed = compact_seed
         self._release_payload = release_payload
         self._compressed_content: Buffer = b""
         self._compressed_handle: SpoolHandle | None = None
@@ -665,12 +682,19 @@ class _DoubleBuilder:
         dict_c = min(
             max(1 << 20, 1 << max(20, content_len.bit_length())), 64 << 20
         )
-        compressed, handle = lzma2_raw_buffer(
-            content,
-            dict_c,
-            self.preset,
-            threshold=SPOOL_THRESHOLD,
-        )
+        if self._content_reader is None:
+            compressed, handle = lzma2_raw_buffer(
+                content,
+                dict_c,
+                self.preset,
+                threshold=SPOOL_THRESHOLD,
+            )
+        else:
+            compressed, handle = lzma2_raw_reader(
+                self._content_reader(),
+                dict_c,
+                self.preset,
+            )
         self._compressed_content = compressed
         self._compressed_handle = handle
         if self._release_payload is not None:
@@ -1039,21 +1063,23 @@ class _DoubleBuilder:
         out[header_offset : header_offset + header_len] = layout["header"]
 
         compressed = layout.pop("C")
-        seed = bytearray(int(layout["ds"]))
         lc = int(layout["lc"])
-        seed[0:lc] = compressed
-        seed[lc : lc + 32] = out[0:32]
-        seed[lc + 32 : lc + 32 + header_len] = out[
-            header_offset : header_offset + header_len
-        ]
-        position = lc + 32 + header_len
-        for part in layout["plant_parts"]:
-            seed[position : position + len(part)] = part
-            position += len(part)
-        pad = int(layout["plant_pad"])
-        if pad:
-            seed[position:] = b"\x00" * pad
-        assert position + pad == layout["ds"], "seed size mismatch"
+        seed = None
+        if not self._compact_seed:
+            seed = bytearray(int(layout["ds"]))
+            seed[0:lc] = compressed
+            seed[lc : lc + 32] = out[0:32]
+            seed[lc + 32 : lc + 32 + header_len] = out[
+                header_offset : header_offset + header_len
+            ]
+            position = lc + 32 + header_len
+            for part in layout["plant_parts"]:
+                seed[position : position + len(part)] = part
+                position += len(part)
+            pad = int(layout["plant_pad"])
+            if pad:
+                seed[position:] = b"\x00" * pad
+            assert position + pad == layout["ds"], "seed size mismatch"
 
         mseg_tail = layout["mseg"] + b"\x00"
         for chunk in chunks:
@@ -1063,16 +1089,71 @@ class _DoubleBuilder:
             length = chunk["olen"]
             source = chunk["src"]
             if source[0] == "seed":
-                out[start : start + length] = seed[
-                    source[1] : source[1] + length
-                ]
+                if self._compact_seed:
+                    self._copy_seed_source(
+                        out, start, source[1], length, layout, compressed
+                    )
+                else:
+                    assert seed is not None
+                    out[start : start + length] = seed[
+                        source[1] : source[1] + length
+                    ]
             elif source[0] == "tab":
                 out[start : start + length] = layout["hdr_tab"][source[1]]
             else:
                 out[start : start + length] = mseg_tail[
                     source[1] : source[1] + length
                 ]
-        return out, seed
+        if isinstance(compressed, memoryview):
+            compressed.release()
+        self.close()
+        return out, (b"" if seed is None else seed)
+
+    def _copy_seed_source(
+        self,
+        out: bytearray,
+        target: int,
+        source: int,
+        length: int,
+        layout: dict[str, object],
+        compressed: Buffer,
+    ) -> None:
+        """Copy a virtual seed range without materialising the whole seed."""
+        lc = int(layout["lc"])
+        header_len = int(layout["H"])
+        header_offset = int(layout["total"]) - header_len
+        ended = source + length
+        position = source
+        while position < ended:
+            if position < lc:
+                piece = min(ended, lc) - position
+                out[target : target + piece] = compressed[position : position + piece]
+            elif position < lc + 32:
+                start = position - lc
+                piece = min(ended, lc + 32) - position
+                out[target : target + piece] = out[start : start + piece]
+            elif position < lc + 32 + header_len:
+                start = header_offset + (position - lc - 32)
+                piece = min(ended, lc + 32 + header_len) - position
+                out[target : target + piece] = out[start : start + piece]
+            else:
+                plant_start = lc + 32 + header_len
+                plant_end = plant_start + sum(
+                    len(part) for part in layout["plant_parts"]
+                )
+                if position < plant_end:
+                    rel = position - plant_start
+                    for part in layout["plant_parts"]:
+                        if rel < len(part):
+                            piece = min(ended - position, len(part) - rel)
+                            out[target : target + piece] = part[rel : rel + piece]
+                            break
+                        rel -= len(part)
+                else:
+                    piece = ended - position
+                    out[target : target + piece] = bytes(piece)
+            target += piece
+            position += piece
 
     def _seed_offsets(self, layout: dict[str, object], offset: int) -> tuple[int, int]:
         for chunk in layout["ochunks"]:
@@ -1234,10 +1315,11 @@ class _DoubleBuilder:
         header_offset = int(layout["total"]) - int(layout["H"])
         lc = int(layout["lc"])
         header_len = int(layout["H"])
-        seed[lc : lc + 32] = out[0:32]
-        seed[lc + 32 : lc + 32 + header_len] = out[
-            header_offset : header_offset + header_len
-        ]
+        if seed:
+            seed[lc : lc + 32] = out[0:32]
+            seed[lc + 32 : lc + 32 + header_len] = out[
+                header_offset : header_offset + header_len
+            ]
         return out, layout, seed
 
 
@@ -1268,13 +1350,37 @@ def build_archive(
     """Build the 7z archive, spooling large payloads to temp files."""
     entries = _prepare_entries(payload, quine_name, seed_name)
     files = tuple((entry.path, entry.data or b"") for entry in payload.files)
-    content = payload.content_view
-    release = payload.release_content if release_payload and compressed else None
-    builder = (
-        _DoubleBuilder(entries, files, content, preset, release)
-        if compressed
-        else _StoreBuilder(entries, files, content)
+    compact = (
+        compressed
+        and release_payload
+        and payload.total_bytes >= SPOOL_THRESHOLD
     )
+    if compact:
+        file_sizes = tuple(len(data) for _, data in files)
+        file_crcs = tuple(_crc32(data) for _, data in files)
+        files = tuple((name, b"") for name, _ in files)
+        content = b""
+        payload.release_views_keep_store()
+        builder = _DoubleBuilder(
+            entries,
+            files,
+            content,
+            preset,
+            payload.close,
+            content_len=payload.total_bytes,
+            content_reader=payload.iter_content,
+            compact_seed=True,
+            file_sizes=file_sizes,
+            file_crcs=file_crcs,
+        )
+    else:
+        content = payload.content_view
+        release = payload.release_content if release_payload and compressed else None
+        builder = (
+            _DoubleBuilder(entries, files, content, preset, release)
+            if compressed
+            else _StoreBuilder(entries, files, content)
+        )
     # The builder now owns these views.  Dropping the caller's references lets
     # a release callback unmap the payload while build() is still running.
     del content, files
