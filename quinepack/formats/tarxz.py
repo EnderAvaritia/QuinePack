@@ -26,8 +26,10 @@ import ctypes.util
 import io
 import lzma
 import struct
+import sys
 import tarfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from multiprocessing import shared_memory
 
 from ..buffers import Buffer, SPOOL_THRESHOLD, SpoolHandle, SpoolWriter
 from ..errors import PayloadError
@@ -40,6 +42,7 @@ from ..lzma2 import (
     store_hdr,
 )
 from ..model import Payload, PayloadEntry
+from ..parallel import open_pool, worker_count
 from ..progress import report
 from .sevenzip import BuildResult
 
@@ -120,31 +123,52 @@ def _make_crc64_slice_tables() -> list[list[int]]:
 
 
 _CRC64_SLICE = _make_crc64_slice_tables()
+_LITTLE_ENDIAN = sys.byteorder == "little"
+
+# Below this many bytes a worker pool costs more than it saves.  Segments keep
+# the work balanced without sending large slice descriptors through the pipe.
+_CRC64_MP_MIN_BYTES = 32 << 20
+_CRC64_MP_SEGMENT = 4 << 20
 
 
 def _crc64_pure_update(state: int, data: Buffer) -> int:
     """Update a raw CRC64 state, eight bytes at a time."""
-    length = len(data)
-    offset = 0
+    view = memoryview(data)
+    length = len(view)
     tables = _CRC64_SLICE
-    while length - offset >= 8:
-        value = state ^ int.from_bytes(data[offset : offset + 8], "little")
-        state = (
-            tables[7][value & 0xFF]
-            ^ tables[6][(value >> 8) & 0xFF]
-            ^ tables[5][(value >> 16) & 0xFF]
-            ^ tables[4][(value >> 24) & 0xFF]
-            ^ tables[3][(value >> 32) & 0xFF]
-            ^ tables[2][(value >> 40) & 0xFF]
-            ^ tables[1][(value >> 48) & 0xFF]
-            ^ tables[0][(value >> 56) & 0xFF]
-        )
-        offset += 8
+    offset = 0
+    if _LITTLE_ENDIAN and length >= 8:
+        words = view[: length & ~7].cast("Q")
+        try:
+            for value in words:
+                value ^= state
+                state = (
+                    tables[7][value & 0xFF]
+                    ^ tables[6][(value >> 8) & 0xFF]
+                    ^ tables[5][(value >> 16) & 0xFF]
+                    ^ tables[4][(value >> 24) & 0xFF]
+                    ^ tables[3][(value >> 32) & 0xFF]
+                    ^ tables[2][(value >> 40) & 0xFF]
+                    ^ tables[1][(value >> 48) & 0xFF]
+                    ^ tables[0][(value >> 56) & 0xFF]
+                )
+        finally:
+            words.release()
+        offset = length & ~7
     table = _CRC64_TABLE
     while offset < length:
-        state = (state >> 8) ^ table[(state ^ data[offset]) & 0xFF]
+        state = (state >> 8) ^ table[(state ^ view[offset]) & 0xFF]
         offset += 1
+    view.release()
     return state
+
+
+def _crc64_combine(left: int, right: int, right_length: int) -> int:
+    """Append ``right_length`` bytes of zeros-worth of transform to a state."""
+    if right_length <= 0:
+        return left ^ right
+    factor = _poly_pow(2, 8 * right_length)
+    return _bit_reverse64(_poly_mul_mod(_bit_reverse64(left), factor)) ^ right
 
 
 def _crc64_update(value: int, data: Buffer) -> int:
@@ -169,11 +193,104 @@ def _crc64_update(value: int, data: Buffer) -> int:
     return state ^ _CRC64_XOROUT
 
 
-def _crc64_parts(parts) -> int:
+def _crc64_parts(parts: Sequence[Buffer], pool=None) -> int:
+    """CRC64 of the concatenation of ``parts``, spread over a worker pool.
+
+    The stream is hashed as raw states from a zero register: the first slice
+    starts from the CRC64 init value and the rest from zero, which lets the
+    parent merge the pieces with ``_crc64_combine``.
+    """
+    parts = tuple(parts)
+    total = sum(len(part) for part in parts)
+    if pool is None or not pool.parallel or total < _CRC64_MP_MIN_BYTES:
+        return _crc64_parts_sequential(parts)
+    try:
+        return _crc64_parts_parallel(parts, pool)
+    except Exception:  # noqa: BLE001 - parallelism must never break a build
+        return _crc64_parts_sequential(parts)
+
+
+def _crc64_parts_sequential(parts: Sequence[Buffer]) -> int:
     value = 0
     for part in parts:
         value = _crc64_update(value, part)
     return value
+
+
+def _crc64_worker(task: tuple[int, list[tuple[str, int, int]]]) -> int:
+    """Hash one contiguous slice of the logical stream inside a worker."""
+    initial, ranges = task
+    state = initial
+    for name, offset, length in ranges:
+        block = shared_memory.SharedMemory(name=name)
+        try:
+            view = memoryview(block.buf)[offset : offset + length]
+            try:
+                state = _crc64_pure_update(state, view)
+            finally:
+                view.release()
+        finally:
+            block.close()
+    return state
+
+
+def _crc64_tasks(
+    segments: Sequence[tuple[str, int]], workers: int
+) -> tuple[list[tuple[int, list[tuple[str, int, int]]]], list[int]]:
+    """Cut the logical stream into contiguous, roughly equal worker slices."""
+    total = sum(length for _, length in segments)
+    target = max(1, total // workers)
+    tasks: list[tuple[int, list[tuple[str, int, int]]]] = []
+    lengths: list[int] = []
+    initial = _CRC64_XOROUT
+    ranges: list[tuple[str, int, int]] = []
+    current = 0
+    for name, size in segments:
+        offset = 0
+        while offset < size:
+            take = min(size - offset, _CRC64_MP_SEGMENT)
+            if ranges and ranges[-1][0] == name:
+                previous = ranges[-1]
+                ranges[-1] = (name, previous[1], previous[2] + take)
+            else:
+                ranges.append((name, offset, take))
+            current += take
+            offset += take
+            if current >= target and len(tasks) < workers - 1:
+                tasks.append((initial, ranges))
+                lengths.append(current)
+                initial = 0
+                ranges = []
+                current = 0
+    if ranges:
+        tasks.append((initial, ranges))
+        lengths.append(current)
+    return tasks, lengths
+
+
+def _crc64_parts_parallel(parts: Sequence[Buffer], pool) -> int:
+    filled = [(part, len(part)) for part in parts if part]
+    if not filled:
+        return _crc64_parts_sequential(parts)
+    buffers = [
+        shared_memory.SharedMemory(create=True, size=length) for _, length in filled
+    ]
+    try:
+        for buffer, (part, length) in zip(buffers, filled):
+            buffer.buf[:length] = part
+        tasks, lengths = _crc64_tasks(
+            tuple((buffer.name, length) for buffer, (_, length) in zip(buffers, filled)),
+            worker_count(),
+        )
+        states = pool.map(tasks, chunksize=1)
+    finally:
+        for buffer in buffers:
+            buffer.close()
+            buffer.unlink()
+    value = 0
+    for length, state in zip(lengths, states):
+        value = _crc64_combine(value, state, length)
+    return value ^ _CRC64_XOROUT
 
 
 # ---------------------------------------------------------------------------
@@ -1223,33 +1340,37 @@ class _TarXzBuilder:
         archive[
             crc_offset - total : crc_offset - total + CHECK_SIZE
         ] = b"\x00" * CHECK_SIZE
-        crc_poly = _bit_reverse64(
-            _crc64_parts((tar_prefix, archive, zeros))
-        )
-        archive[crc_offset : crc_offset + CHECK_SIZE] = slots[0]
-        archive[
-            crc_offset - total : crc_offset - total + CHECK_SIZE
-        ] = slots[1]
+        stream_total = len(tar_prefix) + len(archive) + len(zeros)
+        with open_pool(
+            _crc64_worker, enabled=stream_total >= _CRC64_MP_MIN_BYTES
+        ) as pool:
+            crc_poly = _bit_reverse64(
+                _crc64_parts((tar_prefix, archive, zeros), pool)
+            )
+            archive[crc_offset : crc_offset + CHECK_SIZE] = slots[0]
+            archive[
+                crc_offset - total : crc_offset - total + CHECK_SIZE
+            ] = slots[1]
 
-        trailing1 = (stream_length - crc_w1 - 8) * 8
-        p1 = _poly_pow(2, 64 + trailing1)
-        trailing2 = (stream_length - crc_w2 - 8) * 8
-        p2 = _poly_pow(2, 64 + trailing2)
+            trailing1 = (stream_length - crc_w1 - 8) * 8
+            p1 = _poly_pow(2, 64 + trailing1)
+            trailing2 = (stream_length - crc_w2 - 8) * 8
+            p2 = _poly_pow(2, 64 + trailing2)
 
-        inverse = _poly_minv(1 ^ p1 ^ p2)
-        if inverse == 0:
-            raise RuntimeError("CRC64 polynomial has no inverse")
-        value = _bit_reverse64(_poly_mul_mod(crc_poly, inverse))
+            inverse = _poly_minv(1 ^ p1 ^ p2)
+            if inverse == 0:
+                raise RuntimeError("CRC64 polynomial has no inverse")
+            value = _bit_reverse64(_poly_mul_mod(crc_poly, inverse))
 
-        struct.pack_into("<Q", archive, crc_offset, value)
-        vac = next(
-            chunk for chunk in layout["chunks"] if chunk.get("vac")
-        )
-        _forward_vac(archive, vac, q)
+            struct.pack_into("<Q", archive, crc_offset, value)
+            vac = next(
+                chunk for chunk in layout["chunks"] if chunk.get("vac")
+            )
+            _forward_vac(archive, vac, q)
 
-        assert (
-            _crc64_parts((tar_prefix, archive, zeros)) == value
-        ), "CRC64 fixpoint verification failed"
+            assert (
+                _crc64_parts((tar_prefix, archive, zeros), pool) == value
+            ), "CRC64 fixpoint verification failed"
 
     # -- public build ------------------------------------------------------
 

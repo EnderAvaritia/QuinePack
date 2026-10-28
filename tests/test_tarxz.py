@@ -20,13 +20,17 @@ from quinepack.formats.tarxz import (
     BuildResult,
     _TarXzBuilder,
     _add_gear,
+    _crc64_parts_parallel,
+    _crc64_parts_sequential,
     _crc64_update,
+    _crc64_worker,
     _round_up_512,
     build_archive,
     verify_built,
 )
 from quinepack.lzma2 import CHUNK, LZ2_MAX_UNPACKED
 from quinepack.model import Payload, PayloadEntry
+from quinepack.parallel import TaskPool
 from quinepack.verify import verify_archive
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -197,6 +201,18 @@ def test_unicode_names_roundtrip() -> None:
         assert member.isfile()
         assert member.pax_headers["path"] == "文档/说明.txt"
         assert archive.getmember("文档").isdir()
+
+
+def test_crc64_parts_parallel_matches_sequential() -> None:
+    parts = (
+        bytes(range(256)) * 13,
+        bytearray(range(251)) * 7,
+        b"\x00" * 9,
+    )
+    expected = _crc64_parts_sequential(parts)
+    with TaskPool(_crc64_worker, workers=2) as pool:
+        assert _crc64_parts_parallel(parts, pool) == expected
+    assert _crc64_parts_sequential((b"".join(parts),)) == expected
 
 
 def test_crc64_update_matches_one_pass() -> None:

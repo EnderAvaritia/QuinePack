@@ -38,6 +38,7 @@ from ..lzma2 import (
     store_hdr,
 )
 from ..model import Payload
+from ..parallel import open_pool
 from ..progress import report
 
 SIG = b"7z\xbc\xaf'\x1c"
@@ -194,6 +195,23 @@ def _build_header(
     return bytes(out), crc_base
 
 
+# Encoding tasks are cheap; below this payload size process start-up costs
+# more than the parallel win.
+_STORE_MP_MIN_BYTES = 8 << 20
+
+
+def _encode_match_chunk(task: tuple[int, int, int]) -> bytes:
+    """Encode one match-only LZMA2 chunk from a ``(distance, total, pos)`` plan.
+
+    The result depends only on the task, so a batch of them is safe to run in
+    worker processes and produces the same bytes in any order.
+    """
+    distance, total, out_pos = task
+    block, unpacked = lzma_chunk(matches_for(distance, total), out_pos)
+    assert unpacked == total
+    return block
+
+
 # ---------------------------------------------------------------------------
 # Store-only builder (single-coder LZMA2 stream of uncompressed chunks)
 # ---------------------------------------------------------------------------
@@ -211,7 +229,12 @@ class _StoreBuilder:
         self.content = content
 
     def layout(
-        self, d_seed: int, maxdist_hint: int, *, large: bool = False
+        self,
+        d_seed: int,
+        maxdist_hint: int,
+        *,
+        large: bool = False,
+        pool=None,
     ) -> dict[str, object]:
         d = d_seed + len(self.content)
         lengths: list[int] = []
@@ -252,41 +275,39 @@ class _StoreBuilder:
             assert output_pos == d + 35
 
             seed_covered = 0
+            plan: list[tuple[int, int, int]] = []
             for index, length in enumerate(lengths):
                 if index > 0:
-                    source_pos = 0 if (index < chunk_count - 1 or length == CHUNK) else 3
-                    distance = (d + 35 + seed_covered + 3 * (index - 1)) - source_pos
-                    block, unpacked = lzma_chunk([("m", distance, 3)], output_pos)
-                    assert unpacked == 3
-                    chunks.append(
-                        {
-                            "kind": "lzma",
-                            "foff": file_pos,
-                            "size": len(block),
-                            "ooff": output_pos,
-                            "olen": unpacked,
-                            "bytes": block,
-                        }
+                    source_pos = (
+                        0 if (index < chunk_count - 1 or length == CHUNK) else 3
                     )
-                    output_pos += unpacked
-                    file_pos += len(block)
-                block, unpacked = lzma_chunk(
-                    matches_for(d + 35 + 3 * index, length), output_pos
-                )
-                assert unpacked == length
+                    distance = (d + 35 + seed_covered + 3 * (index - 1)) - source_pos
+                    plan.append((distance, 3, output_pos))
+                    output_pos += 3
+                plan.append((d + 35 + 3 * index, length, output_pos))
+                output_pos += length
+                seed_covered += length
+
+            # Every match chunk starts from a fresh range coder, so the batch
+            # is a pure function of the plan above: encode it in parallel and
+            # sum `file_pos` back here in plan order.
+            blocks = (
+                [_encode_match_chunk(task) for task in plan]
+                if pool is None
+                else pool.map(plan, chunksize=16)
+            )
+            for (_, total, chunk_pos), block in zip(plan, blocks):
                 chunks.append(
                     {
                         "kind": "lzma",
                         "foff": file_pos,
                         "size": len(block),
-                        "ooff": output_pos,
-                        "olen": unpacked,
+                        "ooff": chunk_pos,
+                        "olen": total,
                         "bytes": block,
                     }
                 )
-                output_pos += unpacked
                 file_pos += len(block)
-                seed_covered += length
 
             slip = file_pos - (output_pos - d)
             if slip + 3 <= CHUNK:
@@ -1039,36 +1060,41 @@ class _StoreBuilder:
         last_error: Exception | None = None
         large = False
         report("laying out")
-        for _ in range(80):
-            d = d_seed + len(self.content)
-            if (d + 35) % CHUNK == 1:
-                d_seed += 1
-                continue
-            # The planted copy reads from output position 6, roughly 2*d
-            # bytes behind the jump chunk, so the dictionary must cover it.
-            max_distance = max(
-                2 * (len(self.content) + 128) + (1 << 21),
-                2 * d + (1 << 21),
-            )
-            try:
-                layout = self.layout(d_seed, max_distance, large=large)
-                need_ds = int(layout["need_ds"])
-                if d_seed < need_ds:
-                    d_seed = need_ds
+        with open_pool(
+            _encode_match_chunk, enabled=len(self.content) >= _STORE_MP_MIN_BYTES
+        ) as pool:
+            for _ in range(80):
+                d = d_seed + len(self.content)
+                if (d + 35) % CHUNK == 1:
+                    d_seed += 1
                     continue
-                report("assembling")
-                out, seed = self.assemble(layout)
-                report("fixing CRCs")
-                self.solve_crc(out, layout, seed)
-                return out, layout, seed
-            except _StoreHeaderTooLarge:
-                if large:
-                    raise
-                large = True
-                continue
-            except (RuntimeError, AssertionError) as error:
-                last_error = error
-                d_seed += 1
+                # The planted copy reads from output position 6, roughly 2*d
+                # bytes behind the jump chunk, so the dictionary must cover it.
+                max_distance = max(
+                    2 * (len(self.content) + 128) + (1 << 21),
+                    2 * d + (1 << 21),
+                )
+                try:
+                    layout = self.layout(
+                        d_seed, max_distance, large=large, pool=pool
+                    )
+                    need_ds = int(layout["need_ds"])
+                    if d_seed < need_ds:
+                        d_seed = need_ds
+                        continue
+                    report("assembling")
+                    out, seed = self.assemble(layout)
+                    report("fixing CRCs")
+                    self.solve_crc(out, layout, seed)
+                    return out, layout, seed
+                except _StoreHeaderTooLarge:
+                    if large:
+                        raise
+                    large = True
+                    continue
+                except (RuntimeError, AssertionError) as error:
+                    last_error = error
+                    d_seed += 1
         raise RuntimeError(f"store build failed: {last_error}")
 
 
