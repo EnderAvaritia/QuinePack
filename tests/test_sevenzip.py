@@ -13,9 +13,11 @@ import pytest
 from quinepack.errors import SevenZipMissingError
 from quinepack.formats.sevenzip import (
     BuildResult,
+    _StoreBuilder,
     build_archive,
     verify_built,
 )
+from quinepack.lzma2 import CHUNK, LZ2_MAX_UNPACKED
 from quinepack.model import Payload, PayloadEntry
 from quinepack.verify import find_seven_zip
 
@@ -160,6 +162,110 @@ def test_multi_chunk_content_roundtrip() -> None:
 
     verify_built(result, payload)
     assert result.files == (("large.bin", data),)
+
+
+class _LenOnlyContent:
+    """Content stub: ``layout`` only needs ``len(content)``, not the bytes."""
+
+    def __init__(self, length: int) -> None:
+        self._length = length
+
+    def __len__(self) -> int:
+        return self._length
+
+
+def _converged_store_layout(content_len: int) -> tuple[dict[str, object], int]:
+    builder = _StoreBuilder((), (), _LenOnlyContent(content_len))
+    d_seed = 64
+    for _ in range(10):
+        d = d_seed + content_len
+        layout = builder.layout(d_seed, 2 * d + (1 << 21))
+        need_ds = int(layout["need_ds"])
+        if d_seed >= need_ds:
+            return layout, d_seed
+        d_seed = need_ds
+    raise AssertionError("store layout did not converge")
+
+
+def _assert_gadget_slip_is_minus_three(layout: dict[str, object]) -> None:
+    chunks = list(layout["chunks"])
+    jumps = [chunk for chunk in chunks if chunk.get("jump")]
+    vacs = [chunk for chunk in chunks if chunk.get("vac")]
+    assert len(jumps) == 1
+    assert len(vacs) == 1
+    jump, vac = jumps[0], vacs[0]
+    jump_y = int(layout["jump_y"])
+    d = int(layout["d"])
+    assert int(vac["foff"]) == (int(jump["ooff"]) + jump_y - d) - 3
+
+
+def test_store_layout_keeps_gear_branch_at_32mib() -> None:
+    layout, d_seed = _converged_store_layout(32 * 1024 * 1024)
+    jump_y = int(layout["jump_y"])
+
+    # The small branch must keep the original 64-byte seed and small jump.
+    assert d_seed == 64
+    assert int(layout["need_ds"]) == 0
+    assert jump_y + 6 <= 64
+    assert jump_y <= CHUNK
+
+    gear_stores = [
+        chunk
+        for chunk in layout["chunks"]
+        if chunk["kind"] == "store"
+        and not chunk.get("c1")
+        and not chunk.get("vac")
+    ]
+    assert gear_stores, "expected at least one gear store chunk"
+    _assert_gadget_slip_is_minus_three(layout)
+
+
+def test_store_layout_plants_copy_when_slip_exceeds_chunk() -> None:
+    layout, d_seed = _converged_store_layout(48 * 1024 * 1024)
+    jump_y = int(layout["jump_y"])
+    need_ds = int(layout["need_ds"])
+
+    # The oversized gear pair is impossible; the planted branch must take over.
+    assert need_ds == jump_y + 6
+    assert need_ds > 64
+    assert jump_y > CHUNK
+    assert jump_y < LZ2_MAX_UNPACKED
+
+    chunks = list(layout["chunks"])
+    jumps = [chunk for chunk in chunks if chunk.get("jump")]
+    vacs = [chunk for chunk in chunks if chunk.get("vac")]
+    assert len(jumps) == 1
+    jump, vac = jumps[0], vacs[0]
+    planted = [
+        chunk
+        for chunk in chunks
+        if int(chunk["foff"]) >= int(jump["foff"])
+        and int(chunk["foff"]) < int(vac["foff"])
+    ]
+    assert planted and all(chunk["kind"] == "lzma" for chunk in planted)
+    assert sum(int(chunk["olen"]) for chunk in planted) == jump_y
+    _assert_gadget_slip_is_minus_three(layout)
+
+
+@pytest.mark.skipif(
+    os.environ.get("QUINEPACK_SLOW_STORE") != "1",
+    reason="set QUINEPACK_SLOW_STORE=1 to run the 48 MiB store build",
+)
+def test_large_store_roundtrip_48mib() -> None:
+    data = os.urandom(48 * 1024 * 1024)
+    entry = _file("large.bin", data)
+    payload = _payload((entry,), single_file=True)
+
+    result = build_archive(
+        payload,
+        quine_name="large.store.7z",
+        seed_name=".quinepack/large.store.7z.seed",
+        compressed=False,
+    )
+
+    verify_built(result, payload)
+    assert int(result.layout["ds"]) > 64
+    assert len(result.data) >= len(data)
 
 
 def test_seed_parent_directory_is_not_duplicated() -> None:

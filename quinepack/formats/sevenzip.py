@@ -282,23 +282,54 @@ class _StoreBuilder:
                 file_pos += len(block)
                 seed_covered += length
 
-            while file_pos - (output_pos - d) > 16:
+            slip = file_pos - (output_pos - d)
+            if slip + 3 <= CHUNK:
+                # A store(s) + copy(s) pair is aligned only when s == slip+3:
+                # the payload then occupies exactly the copy's target region.
+                # While the whole slip fits in one LZMA2 store chunk, gears
+                # shrink it to the small range the jump below can absorb.
+                while file_pos - (output_pos - d) > 16:
+                    slip = file_pos - (output_pos - d)
+                    size = min(slip + 3, CHUNK)
+                    chunks.append(
+                        {
+                            "kind": "store",
+                            "foff": file_pos,
+                            "size": 3 + size,
+                            "ooff": output_pos,
+                            "olen": size,
+                        }
+                    )
+                    output_pos += size
+                    file_pos += 3 + size
+                    block, unpacked = lzma_chunk(
+                        matches_for(size, size), output_pos
+                    )
+                    chunks.append(
+                        {
+                            "kind": "lzma",
+                            "foff": file_pos,
+                            "size": len(block),
+                            "ooff": output_pos,
+                            "olen": unpacked,
+                            "bytes": block,
+                        }
+                    )
+                    output_pos += unpacked
+                    file_pos += len(block)
+
                 slip = file_pos - (output_pos - d)
-                size = min(slip + 3, CHUNK)
-                chunks.append(
-                    {
-                        "kind": "store",
-                        "foff": file_pos,
-                        "size": 3 + size,
-                        "ooff": output_pos,
-                        "olen": size,
-                    }
-                )
-                output_pos += size
-                file_pos += 3 + size
-                block, unpacked = lzma_chunk(
-                    matches_for(size, size), output_pos
-                )
+                jump_len = slip + 17
+                for _ in range(10):
+                    block, unpacked = lzma_chunk(
+                        [("m", output_pos - 6, jump_len)], output_pos
+                    )
+                    next_len = slip + 3 + len(block)
+                    if next_len == jump_len:
+                        break
+                    jump_len = next_len
+                assert unpacked == jump_len and next_len == jump_len
+                assert jump_len + 6 <= d_seed
                 chunks.append(
                     {
                         "kind": "lzma",
@@ -307,36 +338,55 @@ class _StoreBuilder:
                         "ooff": output_pos,
                         "olen": unpacked,
                         "bytes": block,
+                        "jump": True,
                     }
                 )
                 output_pos += unpacked
                 file_pos += len(block)
+                need_ds = 0
+            else:
+                # The residual mechanical region is larger than one store
+                # chunk, so no aligned gear pair exists.  Plant a byte image
+                # of the whole region in the seed and copy it with matches
+                # (chained rep0 for lengths above MAX_MATCH).
+                jump_len = slip + 3
+                for _ in range(30):
+                    offset = 0
+                    planted_pos = output_pos
+                    encoded_total = 0
+                    pieces: list[tuple[bytes, int]] = []
+                    while offset < jump_len:
+                        take = min(jump_len - offset, LZ2_MAX_UNPACKED)
+                        distance = planted_pos - (6 + offset)
+                        block, unpacked = lzma_chunk(
+                            matches_for(distance, take), planted_pos
+                        )
+                        assert unpacked == take
+                        pieces.append((block, take))
+                        encoded_total += len(block)
+                        planted_pos += take
+                        offset += take
+                    next_len = slip + 3 + encoded_total
+                    if next_len == jump_len:
+                        break
+                    jump_len = next_len
+                assert next_len == jump_len, "planted copy did not converge"
 
-            slip = file_pos - (output_pos - d)
-            jump_len = slip + 17
-            for _ in range(10):
-                block, unpacked = lzma_chunk(
-                    [("m", output_pos - 6, jump_len)], output_pos
-                )
-                next_len = slip + 3 + len(block)
-                if next_len == jump_len:
-                    break
-                jump_len = next_len
-            assert unpacked == jump_len and next_len == jump_len
-            assert jump_len + 6 <= d_seed
-            chunks.append(
-                {
-                    "kind": "lzma",
-                    "foff": file_pos,
-                    "size": len(block),
-                    "ooff": output_pos,
-                    "olen": unpacked,
-                    "bytes": block,
-                    "jump": True,
-                }
-            )
-            output_pos += unpacked
-            file_pos += len(block)
+                need_ds = jump_len + 6
+                for index, (block, take) in enumerate(pieces):
+                    chunk = {
+                        "kind": "lzma",
+                        "foff": file_pos,
+                        "size": len(block),
+                        "ooff": output_pos,
+                        "olen": take,
+                        "bytes": block,
+                    }
+                    if index == 0:
+                        chunk["jump"] = True
+                    chunks.append(chunk)
+                    output_pos += take
+                    file_pos += len(block)
 
             assert file_pos == (output_pos - d) - 3
             chunks.append(
@@ -413,6 +463,7 @@ class _StoreBuilder:
                     "hdrA": header_a,
                     "hdrB": header_b,
                     "jump_y": jump_len,
+                    "need_ds": need_ds,
                     "n_sub": len(sub_sizes),
                     "sub_sizes": sub_sizes,
                     "dict_size": dict_size,
@@ -609,7 +660,6 @@ class _StoreBuilder:
         return values
 
     def build(self) -> tuple[bytes | bytearray, dict[str, object], bytes | bytearray]:
-        max_distance = 2 * (len(self.content) + 128) + (1 << 21)
         d_seed = 64
         last_error: Exception | None = None
         report("laying out")
@@ -618,8 +668,18 @@ class _StoreBuilder:
             if (d + 35) % CHUNK == 1:
                 d_seed += 1
                 continue
+            # The planted copy reads from output position 6, roughly 2*d
+            # bytes behind the jump chunk, so the dictionary must cover it.
+            max_distance = max(
+                2 * (len(self.content) + 128) + (1 << 21),
+                2 * d + (1 << 21),
+            )
             try:
                 layout = self.layout(d_seed, max_distance)
+                need_ds = int(layout["need_ds"])
+                if d_seed < need_ds:
+                    d_seed = need_ds
+                    continue
                 report("assembling")
                 out, seed = self.assemble(layout)
                 report("fixing CRCs")
