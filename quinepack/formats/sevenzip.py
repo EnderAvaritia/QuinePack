@@ -68,6 +68,10 @@ class _Entry:
     attributes: int = 0
 
 
+class _StoreHeaderTooLarge(RuntimeError):
+    """The 7z footer cannot fit in one LZMA2 store chunk."""
+
+
 # ---------------------------------------------------------------------------
 # Small 7z helpers
 # ---------------------------------------------------------------------------
@@ -443,6 +447,13 @@ class _StoreBuilder:
             )
             new_header_size = len(header)
             new_gadget_size = len(block) + 1 + new_header_size
+            if new_gadget_size > CHUNK:
+                raise _StoreHeaderTooLarge(
+                    f"7z-store cannot encode {len(self.entries)} entries: "
+                    f"footer is {new_gadget_size} bytes, above the "
+                    f"{CHUNK}-byte LZMA2 store chunk limit; "
+                    "use --format 7z or --format txz"
+                )
             if (
                 new_gadget_size == gadget_size
                 and new_header_size == header_size
@@ -685,6 +696,8 @@ class _StoreBuilder:
                 report("fixing CRCs")
                 self.solve_crc(out, layout, seed)
                 return out, layout, seed
+            except _StoreHeaderTooLarge:
+                raise
             except (RuntimeError, AssertionError) as error:
                 last_error = error
                 d_seed += 1

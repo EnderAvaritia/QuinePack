@@ -268,6 +268,34 @@ def test_large_store_roundtrip_48mib() -> None:
     assert len(result.data) >= len(data)
 
 
+def test_store_accepts_footer_at_chunk_limit() -> None:
+    entries = tuple(_file(f"f{index:05d}.txt", b"x") for index in range(1660))
+    payload = _payload(entries, single_file=False)
+
+    result = build_archive(
+        payload,
+        quine_name="many.store.7z",
+        seed_name=".quinepack/many.store.7z.seed",
+        compressed=False,
+    )
+
+    verify_built(result, payload)
+    assert int(result.layout["T"]) <= CHUNK
+
+
+def test_store_rejects_header_above_store_chunk() -> None:
+    entries = tuple(_file(f"f{index:05d}.txt", b"x") for index in range(2000))
+    payload = _payload(entries, single_file=False)
+
+    with pytest.raises(RuntimeError, match="7z-store cannot encode .* entries: footer is .* above the 65536-byte"):
+        build_archive(
+            payload,
+            quine_name="many.store.7z",
+            seed_name=".quinepack/many.store.7z.seed",
+            compressed=False,
+        )
+
+
 def test_seed_parent_directory_is_not_duplicated() -> None:
     entries = (
         _dir(".quinepack"),
