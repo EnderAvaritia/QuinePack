@@ -23,17 +23,17 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集：
 
 | 载荷 | `7z` | `7z-store` | `txz` |
 |---|---:|---:|---:|
-| 64 MiB | 727 MiB / 45 s | 149 MiB / 9 s | 277 MiB / 43 s |
-| 256 MiB | 1057 MiB / 226 s | 538 MiB / 35 s | 1050 MiB / 167 s |
-| 1 GiB | 4154 MiB / 936 s | 2094 MiB / 145 s | 4141 MiB / 688 s |
+| 64 MiB | 664 MiB / 44 s | 149 MiB / 9 s | 277 MiB / 43 s |
+| 256 MiB | 697 MiB / 224 s | 538 MiB / 35 s | 1050 MiB / 167 s |
+| 1 GiB | 2107 MiB / 923 s | 2094 MiB / 145 s | 4141 MiB / 688 s |
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
 尚未实现：
 
-- 完整流式写入：载荷、压缩流、tar 前缀已可落盘，但归档 `F` 与压缩版 seed 仍整份驻留；1 GiB 随机载荷峰值仍在 4.1 GB 左右。
-- 顺序压缩路径：压缩输入仍通过 mmap 访问，未改成纯顺序读取，因此 1 GiB 压缩阶段的内存与阶段 3 持平。
+- 归档 `F` 仍整份驻留；压缩版 seed 在 `release_payload` 路径上已改为虚拟种子，不再分配整份 seed。
 - 压缩版 tar.xz（ADR-0002 限定为 store-only）。
+- 已知问题：`txz` 在约 40 MiB 以上、`7z-store` 在 64 MiB 级载荷上会被官方解压器报告 CRC/结构错误；大载荷请优先使用 `7z`，该问题在修复前不要用于生产。
 - 超过 1 GiB 的载荷（ADR-0003）。
 - ZIP 变体（ADR-0006）。
 - `path` 之外的 PAX 记录（mtime 纳秒、超大文件大小、xattr 均不携带）。
