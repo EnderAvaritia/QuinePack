@@ -28,6 +28,7 @@ from ..lzma2 import (
     CHUNK,
     LZ2_MAX_UNPACKED,
     MAX_MATCH,
+    Token,
     dict_prop_for,
     lzma2_raw_buffer,
     lzma2_raw_reader,
@@ -38,7 +39,7 @@ from ..lzma2 import (
     store_hdr,
 )
 from ..model import Payload
-from ..parallel import open_pool
+from ..parallel import TaskPool, open_pool
 from ..progress import report
 
 SIG = b"7z\xbc\xaf'\x1c"
@@ -195,6 +196,89 @@ def _build_header(
     return bytes(out), crc_base
 
 
+# ---------------------------------------------------------------------------
+# CRC32 linear helpers
+# ---------------------------------------------------------------------------
+#
+# The self-reference systems solve for 96/128 unknown bits by asking how each
+# bit flip moves three or four CRCs.  A flip moves a final CRC by a constant
+# that depends only on its position and the buffer length, so the columns can
+# be computed without rescanning the archive for every candidate.
+
+_CRC32_POLY = 0xEDB88320
+
+
+def _make_crc32_table() -> tuple[int, ...]:
+    table = []
+    for index in range(256):
+        value = index
+        for _ in range(8):
+            value = (value >> 1) ^ _CRC32_POLY if value & 1 else value >> 1
+        table.append(value)
+    return tuple(table)
+
+
+_CRC32_TABLE = _make_crc32_table()
+
+
+def _crc32_rows(register: int) -> int:
+    return (register >> 8) ^ _CRC32_TABLE[register & 0xFF]
+
+
+def _crc32_apply(rows: tuple[int, ...], value: int) -> int:
+    result = 0
+    index = 0
+    while value:
+        if value & 1:
+            result ^= rows[index]
+        value >>= 1
+        index += 1
+    return result
+
+
+def _crc32_powers() -> tuple[tuple[int, ...], ...]:
+    rows = tuple(_crc32_rows(1 << index) for index in range(32))
+    powers = [rows]
+    for _ in range(32):
+        previous = powers[-1]
+        powers.append(tuple(_crc32_apply(previous, row) for row in previous))
+    return tuple(powers)
+
+
+_CRC32_POWERS = _crc32_powers()
+
+
+def _crc32_advance(register: int, zero_bytes: int) -> int:
+    """Push a register through ``zero_bytes`` zero bytes."""
+    index = 0
+    while zero_bytes:
+        if zero_bytes & 1:
+            register = _crc32_apply(_CRC32_POWERS[index], register)
+        zero_bytes >>= 1
+        index += 1
+    return register
+
+
+def _crc32_flip(positions: list[int], bit: int, start: int, length: int) -> int:
+    """CRC32 change from flipping ``bit`` of every position inside a region."""
+    value = 0
+    for position in positions:
+        local = position - start
+        if 0 <= local < length:
+            value ^= _crc32_advance(_CRC32_TABLE[1 << bit], length - local - 1)
+    return value
+
+
+def _crc32_flip_tail(
+    position: int, bit: int, start: int, length: int, tail: int
+) -> int:
+    """Like ``_crc32_flip`` for a segment followed by ``tail`` more bytes."""
+    local = position - start
+    if not 0 <= local < length:
+        return 0
+    return _crc32_advance(_CRC32_TABLE[1 << bit], length - local - 1 + tail)
+
+
 # Encoding tasks are cheap; below this payload size process start-up costs
 # more than the parallel win.
 _STORE_MP_MIN_BYTES = 8 << 20
@@ -208,6 +292,36 @@ def _encode_match_chunk(task: tuple[int, int, int]) -> bytes:
     """
     distance, total, out_pos = task
     block, unpacked = lzma_chunk(matches_for(distance, total), out_pos)
+    assert unpacked == total
+    return block
+
+
+_DOUBLE_MP_MIN_BYTES = 4 << 20
+
+
+ChunkTask = tuple[str, tuple[int, int] | list[tuple[int, int]], int]
+
+
+def _encode_chunk(task: ChunkTask) -> bytes:
+    """Encode one planned LZMA2 chunk of the double-LZMA2 builder.
+
+    ``("match", (distance, total), pos)`` covers a single match run and
+    ``("group", pairs, pos)`` a token group of several runs.  Both depend only
+    on the task, so a batch is safe to run in worker processes.
+    """
+    kind, payload, out_pos = task
+    if kind == "group":
+        assert isinstance(payload, list)
+        tokens: list[Token] = []
+        total = 0
+        for distance, length in payload:
+            tokens.extend(matches_for(distance, length))
+            total += length
+    else:
+        assert isinstance(payload, tuple)
+        distance, total = payload
+        tokens = matches_for(distance, total)
+    block, unpacked = lzma_chunk(tokens, out_pos)
     assert unpacked == total
     return block
 
@@ -811,8 +925,9 @@ class _StoreBuilder:
         chunk_count = int(layout["k"])
         n_sub = int(layout["n_sub"])
         crc_base = int(layout["crc_base"])
-        header_offset = int(layout["total"]) - header_size
-        header_copy = int(layout["total"]) - 2 * gadget_size + (gadget_size - header_size)
+        total = int(layout["total"])
+        header_offset = total - header_size
+        header_copy = total - 2 * gadget_size + (gadget_size - header_size)
 
         known = [_crc32(seed)] + [_crc32(data) for _, data in self.files]
         assert len(known) == n_sub - 1
@@ -839,21 +954,16 @@ class _StoreBuilder:
 
         base = targets()
         base_vector = base[0] | (base[1] << 32) | (base[2] << 64)
+        regions = ((0, total), (header_offset, header_size), (12, 20))
         columns: list[int] = []
         for group in groups:
             for bit_index in range(32):
                 positions = [position + bit_index // 8 for position in group]
                 bit = bit_index % 8
-                for position in positions:
-                    out[position] ^= 1 << bit
-                values = targets()
-                for position in positions:
-                    out[position] ^= 1 << bit
-                columns.append(
-                    (values[0] ^ base[0])
-                    | ((values[1] ^ base[1]) << 32)
-                    | ((values[2] ^ base[2]) << 64)
-                )
+                column = 0
+                for index, (start, length) in enumerate(regions):
+                    column |= _crc32_flip(positions, bit, start, length) << (32 * index)
+                columns.append(column)
 
         equations = []
         for row in range(96):
@@ -986,33 +1096,26 @@ class _StoreBuilder:
                 _crc32(seed),
             )
 
-        def flip(
-            out_copies: list[list[int]],
-            seed_copies: list[list[int]],
-            bit_index: int,
-        ) -> None:
-            byte_index = bit_index // 8
-            bit = 1 << (bit_index % 8)
-            for copy in out_copies:
-                out[copy[byte_index]] ^= bit
-            for copy in seed_copies:
-                seed[copy[byte_index]] ^= bit
-
         base = targets()
         size = 32 * len(groups)
         base_vector = 0
         for index, value in enumerate(base):
             base_vector |= value << (32 * index)
 
+        out_regions = ((0, total), (header_offset, header_size), (12, 20))
         columns: list[int] = []
         for out_copies, seed_copies in groups:
             for bit_index in range(32):
-                flip(out_copies, seed_copies, bit_index)
-                values = targets()
-                flip(out_copies, seed_copies, bit_index)
+                byte_index = bit_index // 8
+                bit = bit_index % 8
+                out_positions = [copy[byte_index] for copy in out_copies]
+                seed_positions = [copy[byte_index] for copy in seed_copies]
                 vector = 0
-                for index, value in enumerate(values):
-                    vector |= (value ^ base[index]) << (32 * index)
+                for index, (start, length) in enumerate(out_regions):
+                    vector |= (
+                        _crc32_flip(out_positions, bit, start, length) << (32 * index)
+                    )
+                vector |= _crc32_flip(seed_positions, bit, 0, d_seed) << 96
                 columns.append(vector)
 
         equations = []
@@ -1140,6 +1243,7 @@ class _DoubleBuilder:
         self._compressed_handle: SpoolHandle | None = None
         self._streams_cache: dict[str, object] | None = None
         self._mseg_cache: bytes | None = None
+        self._pool: TaskPool | None = None
 
     # -- structure ---------------------------------------------------------
 
@@ -1315,46 +1419,10 @@ class _DoubleBuilder:
                 header_table.append(block)
             return index
 
-        chunks: list[dict[str, object]] = []
-        mech = bytearray()
-        file_pos = 32
-        inner_pos = 0
-
-        def put_lzma(tokens, out_pos: int) -> tuple[int, int]:
-            nonlocal file_pos, inner_pos
-            block, unpacked = lzma_chunk(tokens, out_pos)
-            chunks.append(
-                {
-                    "kind": "lzma",
-                    "foff": file_pos,
-                    "size": len(block),
-                    "ioff": out_pos,
-                    "olen": unpacked,
-                    "mech": len(mech),
-                }
-            )
-            mech.extend(block)
-            file_pos += len(block)
-            inner_pos += unpacked
-            return len(block), unpacked
-
-        def put_store(
-            out_pos: int, length: int, header_id_value: int, source: tuple[str, int]
-        ) -> None:
-            nonlocal file_pos, inner_pos
-            chunks.append(
-                {
-                    "kind": "store",
-                    "foff": file_pos,
-                    "size": 3 + length,
-                    "ioff": out_pos,
-                    "olen": length,
-                    "hdr": header_id_value,
-                    "src": source,
-                }
-            )
-            file_pos += 3 + length
-            inner_pos += length
+        # Plan the chunk sequence first.  Every LZMA block starts from a fresh
+        # range coder and depends only on (distance, length, output position),
+        # so the whole batch is encoded after the plan is complete.
+        ops: list[tuple[object, ...]] = []
 
         # Segment 1: inner store chain carrying the seed (compressed content
         # copy, header copies, mechanical plant).
@@ -1366,26 +1434,29 @@ class _DoubleBuilder:
             previous = first_header_at.get(inner_header)
             if previous is None:
                 first_header_at[inner_header] = chunk_offset
-                put_store(
-                    chunk_offset,
-                    3,
-                    header_id(store_hdr(3, first=(index == 0))),
-                    ("tab", header_id(inner_header)),
+                ops.append(
+                    (
+                        "store",
+                        chunk_offset,
+                        3,
+                        header_id(store_hdr(3, first=(index == 0))),
+                        ("tab", header_id(inner_header)),
+                    )
                 )
             else:
-                distance = chunk_offset - previous
-                _, unpacked = put_lzma([("m", distance, 3)], chunk_offset)
-                assert unpacked == 3
-            put_store(
-                chunk_offset + 3,
-                length,
-                header_id(store_hdr(length, first=False)),
-                ("seed", seed_offset),
+                ops.append(("lzma", chunk_offset - previous, 3, chunk_offset))
+            ops.append(
+                (
+                    "store",
+                    chunk_offset + 3,
+                    length,
+                    header_id(store_hdr(length, first=False)),
+                    ("seed", seed_offset),
+                )
             )
             chunk_offset += 3 + length
             seed_offset += length
         assert chunk_offset == outer_content_offset
-        assert inner_pos == outer_content_offset
 
         # Segment 2: compressed content, reproduced from the seed copy.
         content_offset = 0
@@ -1396,24 +1467,68 @@ class _DoubleBuilder:
             assert piece >= 2, piece
             distance = outer_content_offset - 3 * (index + 1)
             assert distance > 0, distance
-            _, unpacked = put_lzma(
-                matches_for(distance, piece), outer_content_offset + content_offset
-            )
-            assert unpacked == piece
+            ops.append(("lzma", distance, piece, outer_content_offset + content_offset))
             content_offset += piece
         assert content_offset == lc
 
-        # Segment 3: inner match chain for the archive bytes plus the inner
-        # stream terminator.
+        # Segment 3: inner match chain for the archive bytes.
         mseg_offset = 0
         for length in mseg_lengths:
-            put_store(
-                outer_content_offset + lc + mseg_offset,
-                length,
-                header_id(store_hdr(length, first=False)),
-                ("mseg", mseg_offset),
+            ops.append(
+                (
+                    "store",
+                    outer_content_offset + lc + mseg_offset,
+                    length,
+                    header_id(store_hdr(length, first=False)),
+                    ("mseg", mseg_offset),
+                )
             )
             mseg_offset += length
+
+        tasks: list[ChunkTask] = [
+            ("match", (int(op[1]), int(op[2])), int(op[3]))
+            for op in ops
+            if op[0] == "lzma"
+        ]
+        blocks = iter(self._encode(tasks))
+
+        chunks: list[dict[str, object]] = []
+        mech = bytearray()
+        file_pos = 32
+        inner_pos = 0
+        for op in ops:
+            if op[0] == "store":
+                _, out_pos, length, header_value, source = op
+                chunks.append(
+                    {
+                        "kind": "store",
+                        "foff": file_pos,
+                        "size": 3 + length,
+                        "ioff": out_pos,
+                        "olen": length,
+                        "hdr": header_value,
+                        "src": source,
+                    }
+                )
+                file_pos += 3 + length
+                inner_pos += length
+            else:
+                _, _, total, out_pos = op
+                block = next(blocks)
+                chunks.append(
+                    {
+                        "kind": "lzma",
+                        "foff": file_pos,
+                        "size": len(block),
+                        "ioff": out_pos,
+                        "olen": total,
+                        "mech": len(mech),
+                    }
+                )
+                mech.extend(block)
+                file_pos += len(block)
+                inner_pos += total
+        assert inner_pos == outer_content_offset + lc + sum(mseg_lengths), inner_pos
 
         chunks.append(
             {
@@ -1475,33 +1590,27 @@ class _DoubleBuilder:
             position += length
         assert position == total, f"segments cover {position} != {total}"
 
-        # Encode one LZMA2 chunk as soon as it is full so the whole token
-        # stream is never resident at once.
-        mseg = bytearray()
+        # Split the match runs at the same LZMA2 chunk boundaries the streaming
+        # encoder used, then encode every group in one batch.  Each group
+        # starts a fresh range coder, so the byte order is unchanged.
+        groups: list[ChunkTask] = []
+        pairs: list[tuple[int, int]] = []
         out_pos = d
-        tokens: list[tuple[str, int] | tuple[str, int, int]] = []
         token_len = 0
-
-        def flush_tokens() -> None:
-            nonlocal out_pos, tokens, token_len
-            if not tokens:
-                return
-            block, unpacked = lzma_chunk(tokens, out_pos)
-            assert unpacked == token_len
-            mseg.extend(block)
-            out_pos += token_len
-            tokens, token_len = [], 0
-
         for foff, length, source_pos in segments:
             distance = (d + foff) - source_pos
             assert distance > 0, f"bad distance {distance} at {foff}"
             if token_len and token_len + length > LZ2_MAX_UNPACKED - MAX_MATCH:
-                flush_tokens()
-            tokens.extend(matches_for(distance, length))
+                groups.append(("group", pairs, out_pos))
+                out_pos += token_len
+                pairs, token_len = [], 0
+            pairs.append((distance, length))
             token_len += length
-        flush_tokens()
+        if pairs:
+            groups.append(("group", pairs, out_pos))
+            out_pos += token_len
         assert out_pos == d + total, f"Mseg output {out_pos} != {d + total}"
-        return bytes(mseg)
+        return b"".join(self._encode(groups))
 
     # -- assembly and CRC --------------------------------------------------
 
@@ -1706,20 +1815,21 @@ class _DoubleBuilder:
         base_vector = 0
         for index, value in enumerate(base):
             base_vector |= value << (32 * index)
+        total = int(layout["total"])
+        plant_tail = sum(len(part) for part in plant_parts) + pad
         columns: list[int] = []
         for own_positions, mirror_positions in groups:
             for bit_index in range(32):
                 byte_index, bit = bit_index // 8, bit_index % 8
-                positions = [own_positions[byte_index], mirror_positions[byte_index]]
-                for position in positions:
-                    out[position] ^= 1 << bit
-                values = targets()
-                for position in positions:
-                    out[position] ^= 1 << bit
-                delta = 0
-                for index, value in enumerate(values):
-                    delta |= (value ^ base[index]) << (32 * index)
-                columns.append(delta)
+                own = own_positions[byte_index]
+                mirrored = mirror_positions[byte_index]
+                column = _crc32_flip_tail(
+                    own, bit, 0, 32, header_len + plant_tail
+                ) ^ _crc32_flip_tail(own, bit, header_offset, header_len, plant_tail)
+                column |= _crc32_flip([own, mirrored], bit, 0, total) << 32
+                column |= _crc32_flip([own], bit, header_offset, header_len) << 64
+                column |= _crc32_flip([own], bit, 12, 20) << 96
+                columns.append(column)
 
         equations = []
         for row in range(bits):
@@ -1762,15 +1872,27 @@ class _DoubleBuilder:
         assert targets() == tuple(values), "CRC fix-up failed"
         return values
 
+    def _encode(self, tasks: list[ChunkTask]) -> list[bytes]:
+        if self._pool is None:
+            return [_encode_chunk(task) for task in tasks]
+        return self._pool.map(tasks, chunksize=16)
+
     def close(self) -> None:
-        """Release the mapped compressed stream, if any."""
+        """Release the mapped compressed stream and the worker pool."""
         self._compressed_content = b""
         if self._compressed_handle is not None:
             self._compressed_handle.close()
             self._compressed_handle = None
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def build(self) -> tuple[Buffer, dict[str, object], Buffer]:
         report("compressing")
+        if self._pool is None:
+            self._pool = open_pool(
+                _encode_chunk, enabled=self.content_len >= _DOUBLE_MP_MIN_BYTES
+            )
         first = self.layout()
         report("laying out")
         layout = self.finalize(first["Y"], first["H"], first["M"])
