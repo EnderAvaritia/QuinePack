@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -23,11 +25,18 @@ from .naming import (
     format_is_compressed,
     seed_name,
 )
+from .parallel import worker_count
 from .progress import stage_sink
 from .scan import scan_payload
 from .verify import verify_archive
 
 DEFAULT_PRESET = 6
+
+# Peak resident memory of one build, as a multiple of the payload size.
+# Measured at 1 GiB: 7z 2.1x, 7z-store 2.1x, txz 5.1x.
+_FORMAT_PEAK_FACTOR = {"7z": 2.2, "7z-store": 2.2, "txz": 5.1}
+_DEFAULT_MEMORY_BUDGET_MIB = 8192
+_FORMAT_MP_MIN_BYTES = 8 << 20
 
 
 class _Parser(argparse.ArgumentParser):
@@ -191,33 +200,171 @@ def _command_pack(args: argparse.Namespace) -> int:
         ):
             reporter.warning("--preset has no effect on 7z-store or txz")
 
-        for format_key, output in selected:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            reporter.info(f"building {output.name}")
-            with stage_sink(reporter.stage):
-                data = _build(
-                    payload,
-                    format_key,
-                    output.name,
-                    preset,
-                    release_payload=len(selected) == 1,
-                )
-            reporter.stage("writing")
-            _write_atomic(output, data)
-            reporter.info(f"wrote {output} ({_human_size(len(data))})")
+        if _can_build_in_parallel(selected, payload):
+            _build_in_parallel(selected, args, payload, preset, reporter)
+        else:
+            for format_key, output in selected:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                reporter.info(f"building {output.name}")
+                with stage_sink(reporter.stage):
+                    data = _build(
+                        payload,
+                        format_key,
+                        output.name,
+                        preset,
+                        release_payload=len(selected) == 1,
+                    )
+                reporter.stage("writing")
+                _write_atomic(output, data)
+                reporter.info(f"wrote {output} ({_human_size(len(data))})")
 
-            if args.verify:
-                reporter.stage("verifying")
-                verify_archive(
-                    output,
-                    against=args.input,
-                    seven_zip=args.seven_zip,
-                    excludes=tuple(args.exclude),
-                )
+                if args.verify:
+                    reporter.stage("verifying")
+                    verify_archive(
+                        output,
+                        against=args.input,
+                        seven_zip=args.seven_zip,
+                        excludes=tuple(args.exclude),
+                    )
 
         return 0
     finally:
         payload.close()
+
+
+def _memory_budget_mib() -> int:
+    raw = os.environ.get("QUINEPACK_MEMORY_BUDGET_MIB")
+    if raw:
+        try:
+            return max(256, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_MEMORY_BUDGET_MIB
+
+
+def _format_peak_mib(format_key: str, total_bytes: int) -> int:
+    """Estimated peak resident memory of one build, in MiB."""
+    factor = _FORMAT_PEAK_FACTOR.get(format_key, 3.0)
+    return int(factor * total_bytes / (1 << 20)) + 256
+
+
+def _can_build_in_parallel(
+    selected: list[tuple[str, Path]], payload: Payload
+) -> bool:
+    """Build several formats at once only when they are big enough to pay off."""
+    return (
+        len(selected) > 1
+        and payload.total_bytes >= _FORMAT_MP_MIN_BYTES
+        and worker_count() > 1
+    )
+
+
+def _child_environment(workers: int) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["QUINEPACK_WORKERS"] = str(max(1, workers))
+    path = [entry for entry in sys.path if entry]
+    inherited = environment.get("PYTHONPATH")
+    if inherited:
+        path.append(inherited)
+    environment["PYTHONPATH"] = os.pathsep.join(path)
+    return environment
+
+
+def _parallel_command(
+    args: argparse.Namespace, format_key: str, output: Path, preset: int
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "quinepack",
+        "pack",
+        str(args.input),
+        "--format",
+        format_key,
+        "--output",
+        str(output),
+        "--force",
+        "--quiet",
+    ]
+    if args.preset is not None and format_is_compressed(format_key):
+        command.extend(["--preset", str(preset)])
+    for pattern in args.exclude:
+        command.extend(["--exclude", str(pattern)])
+    if args.verify:
+        command.append("--verify")
+        if args.seven_zip:
+            command.extend(["--seven-zip", args.seven_zip])
+    return command
+
+
+def _build_in_parallel(
+    selected: list[tuple[str, Path]],
+    args: argparse.Namespace,
+    payload: Payload,
+    preset: int,
+    reporter: "_Reporter",
+) -> None:
+    """Build every selected format in its own process.
+
+    Each child runs the normal single-format command, so the output bytes are
+    exactly the ones a sequential build produces.  Formats start in list order
+    as long as their estimated peaks stay inside the memory budget; the rest
+    wait for a slot to free up.
+    """
+    budget = _memory_budget_mib()
+    cores = worker_count()
+    # Start the heaviest formats first: they decide the wall clock, and a light
+    # format can always fill in around them.
+    pending = sorted(
+        selected, key=lambda item: -_format_peak_mib(item[0], payload.total_bytes)
+    )
+    running: list[tuple[subprocess.Popen[bytes], str, Path, int]] = []
+    used = 0
+    failures: list[str] = []
+    reporter.info(f"building {len(pending)} formats in parallel")
+    try:
+        while pending or running:
+            started = False
+            for item in list(pending):
+                format_key, output = item
+                peak = _format_peak_mib(format_key, payload.total_bytes)
+                if running and (used + peak > budget or len(running) >= cores):
+                    continue
+                pending.remove(item)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                reporter.info(f"building {output.name}")
+                process = subprocess.Popen(
+                    _parallel_command(args, format_key, output, preset),
+                    env=_child_environment(cores // (len(running) + 1)),
+                )
+                running.append((process, format_key, output, peak))
+                used += peak
+                started = True
+            finished = False
+            for entry in list(running):
+                process, format_key, output, peak = entry
+                code = process.poll()
+                if code is None:
+                    continue
+                running.remove(entry)
+                used -= peak
+                finished = True
+                if code != 0:
+                    failures.append(f"{format_key} exited with status {code}")
+                    reporter.warning(f"failed to build {output.name}")
+                else:
+                    reporter.info(
+                        f"wrote {output} ({_human_size(output.stat().st_size)})"
+                    )
+            if not started and not finished:
+                time.sleep(0.05)
+    finally:
+        for process, _, _, _ in running:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    if failures:
+        raise QuinePackError("; ".join(failures))
 
 
 def _command_verify(args: argparse.Namespace) -> int:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import random
 import subprocess
 import sys
 import types
@@ -961,3 +962,80 @@ def test_integration_pack_and_verify(tmp_path: Path) -> None:
     verify_module.verify_archive(
         archive, against=source, seven_zip=seven_zip, workdir=tmp_path
     )
+
+# --- parallel multi-format builds ----------------------------------------
+
+
+def test_format_peak_scales_with_payload() -> None:
+    one_gib = 1 << 30
+    assert cli._format_peak_mib("7z-store", one_gib) == int(2.2 * 1024) + 256
+    assert cli._format_peak_mib("txz", one_gib) > cli._format_peak_mib("7z", one_gib)
+    assert cli._format_peak_mib("7z", 0) == 256
+
+
+def test_memory_budget_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("QUINEPACK_MEMORY_BUDGET_MIB", raising=False)
+    assert cli._memory_budget_mib() == cli._DEFAULT_MEMORY_BUDGET_MIB
+    monkeypatch.setenv("QUINEPACK_MEMORY_BUDGET_MIB", "4096")
+    assert cli._memory_budget_mib() == 4096
+    monkeypatch.setenv("QUINEPACK_MEMORY_BUDGET_MIB", "nonsense")
+    assert cli._memory_budget_mib() == cli._DEFAULT_MEMORY_BUDGET_MIB
+
+
+def test_parallel_formats_need_a_large_payload() -> None:
+    formats = [("7z", Path("a.7z")), ("txz", Path("a.tar.xz"))]
+    small = SimpleNamespace(total_bytes=1 << 20)
+    large = SimpleNamespace(total_bytes=9 << 20)
+    assert not cli._can_build_in_parallel(formats, small)
+    assert cli._can_build_in_parallel(formats, large)
+    assert not cli._can_build_in_parallel(formats[:1], large)
+
+
+def test_parallel_formats_respect_no_mp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QUINEPACK_NO_MP", "1")
+    formats = [("7z", Path("a.7z")), ("txz", Path("a.tar.xz"))]
+    large = SimpleNamespace(total_bytes=9 << 20)
+    assert not cli._can_build_in_parallel(formats, large)
+
+
+def test_parallel_command_targets_one_output(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        input=tmp_path / "in.bin",
+        preset=None,
+        exclude=["*.tmp"],
+        verify=False,
+        seven_zip=None,
+    )
+    command = cli._parallel_command(args, "7z-store", tmp_path / "out.7z", 9)
+    assert "--format" in command and "7z-store" in command
+    assert "--preset" not in command  # store format ignores the preset
+    assert command[command.index("--exclude") + 1] == "*.tmp"
+
+
+def test_parallel_all_builds_byte_identical_archives(tmp_path: Path) -> None:
+    """`--format all` past the size gate fans out and matches a single build."""
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(random.Random(20261029).randbytes(9 << 20))
+    parallel = tmp_path / "parallel"
+    assert (
+        cli.main(
+            ["pack", str(payload), "--format", "all", "--outdir", str(parallel), "--quiet"]
+        )
+        == 0
+    )
+
+    seven = (parallel / "payload.bin.7z").read_bytes()
+    store = (parallel / "payload.bin.store.7z").read_bytes()
+    txz = (parallel / "payload.bin.tar.xz").read_bytes()
+    assert seven[:6] == b"7z\xbc\xaf'\x1c"
+    assert store[:6] == b"7z\xbc\xaf'\x1c"
+    assert txz[:6] == b"\xfd7zXZ\x00"
+
+    solo = tmp_path / "solo"
+    assert (
+        cli.main(
+            ["pack", str(payload), "--format", "txz", "--outdir", str(solo), "--quiet"]
+        )
+        == 0
+    )
+    assert (solo / "payload.bin.tar.xz").read_bytes() == txz

@@ -59,9 +59,19 @@ while True:
 
 
 def worker_count() -> int:
-    """Number of workers to start, honouring ``QUINEPACK_NO_MP``."""
+    """Number of workers to start, honouring the environment overrides.
+
+    ``QUINEPACK_NO_MP`` disables worker processes, ``QUINEPACK_WORKERS`` caps
+    the count (the multi-format build splits the cores between its children).
+    """
     if os.environ.get("QUINEPACK_NO_MP"):
         return 1
+    override = os.environ.get("QUINEPACK_WORKERS")
+    if override:
+        try:
+            return max(1, min(int(override), MAX_WORKERS))
+        except ValueError:
+            pass
     try:
         count = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
     except AttributeError:
