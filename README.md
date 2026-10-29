@@ -195,23 +195,31 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集与耗�
 
 | 载荷 | `7z` | `7z-store` | `txz` |
 |---|---:|---:|---:|
-| 64 MiB | 664 MiB / 44 s | 153 MiB / 6 s | 344 MiB / 7 s |
-| 256 MiB | 697 MiB / 224 s | 548 MiB / 23 s | 1310 MiB / 23 s |
-| 1 GiB | 2107 MiB / 923 s | 2118 MiB / 93 s | 5171 MiB / 88 s |
+| 64 MiB | 665 MiB / 33 s | 153 MiB / 3 s | 344 MiB / 7 s |
+| 256 MiB | 698 MiB / 158 s | 548 MiB / 12 s | 1310 MiB / 23 s |
+| 1 GiB | 2116 MiB / 661 s | 2119 MiB / 47 s | 5171 MiB / 90 s |
 
 每行由 `tools/bench_memory.py` 测得；1 GiB 随机载荷满足 ADR-0007 的 ≤ 8 GB 目标。
 
-`7z-store` 与 `txz` 的耗时来自 ADR-0008 的子进程并行编码；`7z` 路径本次未改动，数字沿用此前基线（复测 64 MiB 44 s、256 MiB 220 s，差异在噪声范围内）。`txz` 的峰值工作集随之上升（64 MiB 279 → 344 MiB，256 MiB 1051 → 1310 MiB，1 GiB 4142 → 5171 MiB），来自并行 CRC64 的共享内存分片副本。
+`7z-store` 与 `txz` 的耗时来自 ADR-0008 的子进程并行编码，再一次由 ADR-0009 的解析 CRC 列向量削掉整份归档的重扫；`7z` 压缩版的剩余时间有 87% 是 `lzma.LZMACompressor` 的单线程 C 编码（64 MiB 载荷 33.4 s 中 29.1 s），标准库没有多线程 LZMA2 编码器。`txz` 的峰值工作集随并行 CRC64 上升（64 MiB 279 → 344 MiB，256 MiB 1051 → 1310 MiB，1 GiB 4142 → 5171 MiB），来自共享内存分片副本。
 
-> 旧的 `7z-store` 144.8 s / `txz` 688.2 s 属于修复前产物不可校验的测量，不能作为当前实现的性能承诺。ADR-0008 之前（4 核以上串行）的 `7z-store` 411 s / `txz` 693 s 只用于对比。
+改造前的基线：64 MiB `7z` 44.3 s / `7z-store` 19.4 s / `txz` 45.0 s，256 MiB 224 s / 105 s / 171 s，1 GiB 923 s / 411 s / 693 s。
+
+> 旧的 `7z-store` 144.8 s / `txz` 688.2 s 属于修复前产物不可校验的测量，不能作为当前实现的性能承诺。
 
 ### 并行范围
 
 - `7z-store` 的 match chunk 编码：载荷 ≥ 8 MiB 时按计划分片交给工作进程。
+- `7z` 双层布局的 LZMA 块编码：`_build_streams` / `_build_mseg` 先规划再批量编码，载荷 ≥ 4 MiB 时并行。
 - `txz` 的 CRC64：待哈希流 ≥ 32 MiB 时按共享内存分片并行，父进程用 GF(2) 多项式合并。
-- 两处都只做纯函数分片并按提交顺序回收，产物逐字节不变。
+- 多格式：`--format all`（或任意多格式）在载荷 ≥ 8 MiB 时为每个格式起一个子进程，按估计峰值内存（`7z` / `7z-store` 2.2×、`txz` 5.1× 载荷）和核数调度，默认预算 8192 MiB。
+- 这些分片都只做纯函数切分并按提交顺序回收，产物逐字节不变。
 
-`QUINEPACK_NO_MP=1` 会关闭全部工作进程，退回进程内实现（用于受限环境或调试）。
+环境变量：
+
+- `QUINEPACK_NO_MP=1` 关闭全部工作进程，退回进程内实现（受限环境或调试）。
+- `QUINEPACK_WORKERS=n` 限制每棵进程树的工作进程数（多格式扇出会自动用它分配核数）。
+- `QUINEPACK_MEMORY_BUDGET_MIB=n` 改多格式扇出的内存预算，默认 8192。
 
 ### 1 GiB 验收（当前提交）
 
@@ -224,14 +232,15 @@ Windows、Python 3.12、不可压缩随机载荷实测的峰值工作集与耗�
 
 两种自含副本均与产物逐字节一致。1 GiB 外部 `tar -xJf` 在 Windows 样本上出现 `tar`/`xz` 管道悬挂，因此 `txz` 的自含副本改用 Python `tarfile` 读取校验；归档本身已通过 `xz -t`。
 
-2026-10-29 的 ADR-0008 并行实现复测（载荷名 `random-1024.bin`）：
+2026-10-29 的 ADR-0008 / ADR-0009 复测（载荷名 `random-1024.bin`）：
 
-| 格式 | 产物大小 | 官方校验 |
-|---|---:|---|
-| `7z-store` | 1,077,172,843 B | `7z t` → `Everything is Ok` |
-| `txz` | 1,077,176,176 B | `xz -t` 通过 |
+| 格式 | 产物大小 | 耗时 | 官方校验 |
+|---|---:|---:|---|
+| `7z` | 1,078,228,942 B | 661 s | `7z t` → `Everything is Ok` |
+| `7z-store` | 1,077,172,843 B | 47 s | `7z t` → `Everything is Ok` |
+| `txz` | 1,077,176,176 B | 90 s | `xz -t` 通过 |
 
-同一载荷下 64 MiB 三种产物的 SHA-256 与并行改造前完全一致，说明布局字节未变。
+三个产物的自含副本都用 `python -m quinepack verify` 校验通过。同一载荷下 64 MiB 三种产物的 SHA-256 与并行改造前完全一致，说明布局字节未变；1 GiB 的 `--format all` 扇出构建与单格式构建也逐字节相同（墙钟 686 s，串行合计 797 s）。
 
 ### 多文件条目验收
 
@@ -281,7 +290,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - 仍不是完整流式实现：归档 `F` 仍整份驻留；压缩版 seed 在单格式 `release_payload` 路径上已改为虚拟种子。临时文件位于当前工作目录，构建失败时也会尽力清理。
 - 需要 PAX 扩展头、但名称中含换行等 PAX 不支持的字符时，返回载荷错误（退出码 4），不会截断或静默改名。
 - `7z-store` 的 large-footer 路径会在 header 超过单个 64 KiB store chunk 时，把 footer 镜像放进 seed 并用 match 输出；代价是 seed 与归档约为 `2 × header + 载荷`，极大条目数仍受内存与 LZMA2 字典距离约束。
-- 1 GiB 随机载荷 `7z` 实测约 923 s、峰值约 2.1 GB；100 MiB 级常规载荷的回归测试尚未系统覆盖。
+- 1 GiB 随机载荷 `7z` 实测约 661 s、峰值约 2.1 GB，其中 87% 是单线程 liblzma 编码；100 MiB 级常规载荷的回归测试尚未系统覆盖。
 - 大文件布局回归已覆盖 42 MiB `txz`、48 MiB `7z-store` 与 1 GiB 两格式（官方 `xz -t` / `7z t`，自含副本 SHA-256 一致）；生产使用前请按目标尺寸做性能验收。
 - Windows 上纯 Python CRC64 仍慢于 C 实现；ADR-0008 后它按共享内存分片并行，但 `QUINEPACK_NO_MP=1` 或小于 32 MiB 的流仍走单核。
 
@@ -303,6 +312,7 @@ python tools/bench_memory.py --size 256 --format 7z
 - [ADR-0006](docs/adr/0006-no-zip.md)：ZIP 不纳入产物格式。
 - [ADR-0007](docs/adr/0007-1gib-prototype-baseline.md)：1 GiB 原型基线与内存门槛。
 - [ADR-0008](docs/adr/0008-parallel-encoders.md)：热点编码子进程并行，产物字节不变。
+- [ADR-0009](docs/adr/0009-analytic-crc32-columns.md)：CRC 定点改用解析列向量，不再逐位重扫归档。
 - [CONTEXT.md](CONTEXT.md)：术语表。
 
 ## 许可证
